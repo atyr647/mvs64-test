@@ -34,6 +34,10 @@ static cz80_struc z80_cpu;
 static uint8_t cmd_latch;
 static uint8_t result_latch = 0x01; /* "ready" initial value */
 static int nmi_pending;
+static int nmi_enabled;      /* port $08 write enables, $18 write disables */
+
+/* Z80 bank windows (selected by IN A,($08..$0B); bank number = high byte of port) */
+static uint32_t z80_bank_off[4];  /* ROM offsets: [0]=$F000 2K [1]=$E000 4K [2]=$C000 8K [3]=$8000 16K */
 
 /* YM2610 register state */
 static uint8_t ym_addr1;  /* address port 1 latch */
@@ -54,6 +58,13 @@ static uint8_t  timer_irq_ena;    /* bits: 0=Timer A IRQ, 1=Timer B IRQ */
 #define TIMER_A_PERIOD(v)  (36 * (1024 - (v)))
 #define TIMER_B_PERIOD(v)  (576 * (256 - (v)))
 
+/* YM2610 IRQ output is level-sensitive: asserted while any enabled flag is set. */
+static void ym_update_irq(void)
+{
+	int on = (ym_status & timer_irq_ena & 0x03) != 0;
+	Cz80_Set_IRQ(&z80_cpu, 0, on ? ASSERT_LINE : CLEAR_LINE);
+}
+
 static void timers_advance(int cycles)
 {
 	if (timer_ctrl & 0x01) { /* Timer A running */
@@ -64,8 +75,7 @@ static void timers_advance(int cycles)
 			if (period <= 0) period = 1;
 			while (timer_a_counter <= 0)
 				timer_a_counter += period;
-			if (timer_irq_ena & 0x01)
-				Cz80_Set_IRQ(&z80_cpu, 0, ASSERT_LINE);
+			ym_update_irq();
 		}
 	}
 	if (timer_ctrl & 0x02) { /* Timer B running */
@@ -76,8 +86,7 @@ static void timers_advance(int cycles)
 			if (period <= 0) period = 1;
 			while (timer_b_counter <= 0)
 				timer_b_counter += period;
-			if (timer_irq_ena & 0x02)
-				Cz80_Set_IRQ(&z80_cpu, 0, ASSERT_LINE);
+			ym_update_irq();
 		}
 	}
 }
@@ -181,25 +190,6 @@ void sound_debug_stats(void)
 		debugf("\n");
 	}
 
-	/* One-time ROM analysis */
-	static int rom_dumped = 0;
-	if (!rom_dumped && z80_has_rom) {
-		rom_dumped = 1;
-		/* Dump the three init subroutines that may be stuck */
-		int addrs[] = {0x09D8, 0x0A0A, 0x09F1, 0x01BD, 0x1EDA};
-		const char *names[] = {"$09D8", "$0A0A", "$09F1", "$01BD", "$1EDA"};
-		for (int a = 0; a < 5; a++) {
-			debugf("[SND] ROM@%s:", names[a]);
-			for (int i = addrs[a]; i < addrs[a] + 48 && i < Z80_ROM_SIZE; i++)
-				debugf(" %02x", z80_rom[i]);
-			debugf("\n");
-		}
-		/* Also dump init continuation at $0110 */
-		debugf("[SND] ROM@0110:");
-		for (int i = 0x0110; i < 0x0150 && i < Z80_ROM_SIZE; i++)
-			debugf(" %02x", z80_rom[i]);
-		debugf("\n");
-	}
 #endif
 }
 
@@ -210,99 +200,76 @@ static void ym2610_write_reg2(uint8_t addr, uint8_t val);
 /* ---- Z80 memory read/write callbacks ---- */
 /* CZ80 signatures: read(u32) → u8, write(u32, u8) */
 
+static void z80_map_banks(void)
+{
+	/* Keep CZ80's opcode-fetch pages in sync with the bank windows. */
+	Cz80_Set_Fetch(&z80_cpu, 0x0000, 0x7FFF, (uintptr_t)z80_rom);
+	Cz80_Set_Fetch(&z80_cpu, 0x8000, 0xBFFF, (uintptr_t)(z80_rom + z80_bank_off[3]) - 0x8000);
+	Cz80_Set_Fetch(&z80_cpu, 0xC000, 0xDFFF, (uintptr_t)(z80_rom + z80_bank_off[2]) - 0xC000);
+	Cz80_Set_Fetch(&z80_cpu, 0xE000, 0xEFFF, (uintptr_t)(z80_rom + z80_bank_off[1]) - 0xE000);
+	Cz80_Set_Fetch(&z80_cpu, 0xF000, 0xF7FF, (uintptr_t)(z80_rom + z80_bank_off[0]) - 0xF000);
+	Cz80_Set_Fetch(&z80_cpu, 0xF800, 0xFFFF, (uintptr_t)z80_ram - 0xF800);
+}
+
 static UINT8 z80_read(UINT32 addr)
 {
-	if (addr < Z80_ROM_SIZE)
-		return z80_rom[addr];
-	if (addr >= 0xF800)
-		return z80_ram[addr & (Z80_RAM_SIZE - 1)];
-	return 0xFF;
+	addr &= 0xFFFF;
+	if (addr < 0x8000)  return z80_rom[addr];
+	if (addr >= 0xF800) return z80_ram[addr - 0xF800];
+	if (addr >= 0xF000) return z80_rom[(z80_bank_off[0] + (addr - 0xF000)) & (Z80_ROM_SIZE - 1)];
+	if (addr >= 0xE000) return z80_rom[(z80_bank_off[1] + (addr - 0xE000)) & (Z80_ROM_SIZE - 1)];
+	if (addr >= 0xC000) return z80_rom[(z80_bank_off[2] + (addr - 0xC000)) & (Z80_ROM_SIZE - 1)];
+	return z80_rom[(z80_bank_off[3] + (addr - 0x8000)) & (Z80_ROM_SIZE - 1)];
 }
 
 static void z80_write(UINT32 addr, UINT8 val)
 {
+	addr &= 0xFFFF;
 	if (addr >= 0xF800) {
-		z80_ram[addr & (Z80_RAM_SIZE - 1)] = val;
+		z80_ram[addr - 0xF800] = val;
 		stat_ram_writes++;
 	}
-#ifdef N64
-	/* Track init progress: log writes to key addresses */
-	static int init_trace_done = 0;
-	if (!init_trace_done && addr >= 0xFE20 && addr <= 0xFE96) {
-		debugf("[Z80W] addr=%04lx val=%02x ramW=%lu\n",
-			(unsigned long)addr, val, (unsigned long)stat_ram_writes);
-		if (stat_ram_writes > 200) init_trace_done = 1;
-	}
-#endif
 }
 
 /* ---- Z80 I/O port callbacks ---- */
 
-static UINT8 z80_port_read(UINT16 port)
+static UINT8 z80_port_read(UINT16 fullport)
 {
+	int port = fullport & 0xFF;
+	int hi = fullport >> 8;
 	stat_port_reads++;
-	uint16_t full_port = port;
-	port &= 0xFF;
 	stat_port_rhist[port]++;
-	if (port_trace_n < 32) {
-		port_trace[port_trace_n].port = full_port;
-		port_trace[port_trace_n].val = 0;
-		port_trace[port_trace_n].is_read = 1;
-		port_trace[port_trace_n].pc = (uint16_t)Cz80_Get_Reg(&z80_cpu, CZ80_PC);
-		port_trace_n++;
-	}
 	switch (port) {
-	case 0x00: /* Command from 68K (clears NMI) */
+	case 0x00: /* Command from 68K (clears pending NMI) */
 		nmi_pending = 0;
 		return cmd_latch;
-	case 0x04: /* YM2610 status port 1 (timer flags + busy) */
+	case 0x04: /* YM2610 status port 1 (timer flags) */
 		return ym_status;
 	case 0x06: /* YM2610 status port 2 (ADPCM flags) */
 		return ym_adpcm_status;
+	case 0x08: z80_bank_off[0] = ((uint32_t)hi * 0x0800) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
+	case 0x09: z80_bank_off[1] = ((uint32_t)hi * 0x1000) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
+	case 0x0A: z80_bank_off[2] = ((uint32_t)hi * 0x2000) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
+	case 0x0B: z80_bank_off[3] = ((uint32_t)hi * 0x4000) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
 	default:
 		return 0xFF;
 	}
 }
 
-static void z80_port_write(UINT16 port, UINT8 val)
+static void z80_port_write(UINT16 fullport, UINT8 val)
 {
+	int port = fullport & 0xFF;
 	stat_port_writes++;
-	uint16_t full_port = port;
-	port &= 0xFF;
 	stat_port_hist[port]++;
-	if (port_trace_n < 32) {
-		port_trace[port_trace_n].port = full_port;
-		port_trace[port_trace_n].val = val;
-		port_trace[port_trace_n].is_read = 0;
-		port_trace[port_trace_n].pc = (uint16_t)Cz80_Get_Reg(&z80_cpu, CZ80_PC);
-		port_trace_n++;
-	}
 	switch (port) {
-	case 0x04: /* YM2610 address port 1 */
-		ym_addr1 = val;
-		/* Capture first unique values for debugging */
-		if (stat_p04_nvals < 16) {
-			int dup = 0;
-			for (int i = 0; i < stat_p04_nvals; i++)
-				if (stat_p04_vals[i] == val) { dup = 1; break; }
-			if (!dup) stat_p04_vals[stat_p04_nvals++] = val;
-		}
-		break;
-	case 0x05: /* YM2610 data port 1 */
-		ym2610_write_reg1(ym_addr1, val);
-		break;
-	case 0x06: /* YM2610 address port 2 */
-		ym_addr2 = val;
-		break;
-	case 0x07: /* YM2610 data port 2 */
-		ym2610_write_reg2(ym_addr2, val);
-		break;
-	case 0x08: /* Z80 bank switch */
-		/* TODO: bank switching for accessing 68K ROM space */
-		break;
-	case 0x0C: /* Response to 68K */
-		result_latch = val;
-		break;
+	case 0x04: ym_addr1 = val; break;           /* YM2610 address port 1 */
+	case 0x05: ym2610_write_reg1(ym_addr1, val); break;
+	case 0x06: ym_addr2 = val; break;           /* YM2610 address port 2 */
+	case 0x07: ym2610_write_reg2(ym_addr2, val); break;
+	case 0x08: nmi_enabled = 1; break;          /* enable NMI from 68K */
+	case 0x18: nmi_enabled = 0; break;          /* disable NMI from 68K */
+	case 0x0C: result_latch = val; break;       /* response to 68K */
+	default: break;                             /* $00 (clear latch), $C0 etc: ignore */
 	}
 }
 
@@ -567,14 +534,8 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 		 * bit 3: IRQ enable Timer B
 		 * bit 4: Reset Timer A overflow flag
 		 * bit 5: Reset Timer B overflow flag */
-		if (val & 0x10) {
-			ym_status &= ~0x01;
-			Cz80_Set_IRQ(&z80_cpu, 0, CLEAR_LINE);
-		}
-		if (val & 0x20) {
-			ym_status &= ~0x02;
-			Cz80_Set_IRQ(&z80_cpu, 0, CLEAR_LINE);
-		}
+		if (val & 0x10) ym_status &= ~0x01;
+		if (val & 0x20) ym_status &= ~0x02;
 		/* Load/run timers */
 		if ((val & 0x01) && !(timer_ctrl & 0x01)) {
 			int period = TIMER_A_PERIOD(timer_a_val);
@@ -588,6 +549,7 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 		}
 		timer_ctrl = val & 0x03;
 		timer_irq_ena = (val >> 2) & 0x03;
+		ym_update_irq();
 		return;
 	}
 
@@ -623,7 +585,6 @@ static void ym2610_write_reg2(uint8_t addr, uint8_t val)
 static INT32 z80_irq_callback(INT32 irqline)
 {
 	(void)irqline;
-	Cz80_Set_IRQ(&z80_cpu, 0, CLEAR_LINE);
 	return 0xFF; /* IM 1 vector (RST $38) */
 }
 
@@ -676,7 +637,9 @@ void sound_init(const uint8_t *rom, int rom_size)
 	/* Set up memory map: Z80 address space is 64 KB.
 	 * Fetch table must be set up correctly even if ROM is empty,
 	 * because Cz80_Exec() dereferences Fetch[pc >> FETCH_SFT] + pc. */
-	Cz80_Set_Fetch(&z80_cpu, 0x0000, 0xFFFF, (uintptr_t)z80_rom);
+	memset(z80_bank_off, 0, sizeof(z80_bank_off));
+	nmi_enabled = 0;
+	z80_map_banks();
 
 	Cz80_Set_ReadB(&z80_cpu, z80_read);
 	Cz80_Set_WriteB(&z80_cpu, z80_write);
@@ -688,6 +651,7 @@ void sound_init(const uint8_t *rom, int rom_size)
 
 	result_latch = 0x01;
 	nmi_pending = 0;
+	nmi_enabled = 0;
 
 #ifdef N64
 	rsp_fm_init();
@@ -708,16 +672,16 @@ void sound_update(int cycles)
 
 	stat_update_calls++;
 
-	if (nmi_pending) {
-		Cz80_Set_IRQ(&z80_cpu, IRQ_LINE_NMI, HOLD_LINE);
-		nmi_pending = 0;
-		stat_nmis_fired++;
-	}
-
 	/* Run Z80 in chunks so timers fire mid-frame.
 	 * 4000 cycles ≈ 1 ms — enough granularity for Timer A/B. */
 	while (cycles > 0) {
 		int chunk = (cycles < 4000) ? cycles : 4000;
+		/* The 68K command NMI is gated by the Z80's NMI-enable port. */
+		if (nmi_pending && nmi_enabled) {
+			Cz80_Set_IRQ(&z80_cpu, IRQ_LINE_NMI, HOLD_LINE);
+			nmi_pending = 0;
+			stat_nmis_fired++;
+		}
 		timers_advance(chunk);
 		Cz80_Exec(&z80_cpu, chunk);
 		cycles -= chunk;

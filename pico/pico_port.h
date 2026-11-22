@@ -18,7 +18,9 @@ typedef int64_t        s64;
 typedef uintptr_t      uptr;
 
 /* N64 (MIPS R4300i) is big-endian */
+#ifndef CPU_IS_LE
 #define CPU_IS_LE 0
+#endif
 
 /* Big-endian byte access within 16-bit and 32-bit values */
 #define MEM_LE2(a)  ((a)^1)
