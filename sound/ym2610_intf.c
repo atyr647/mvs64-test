@@ -53,6 +53,7 @@ static int32_t  timer_a_counter;  /* cycles until next Timer A overflow */
 static int32_t  timer_b_counter;  /* cycles until next Timer B overflow */
 static uint8_t  ym_status;        /* status register 0 (bit0=TimerA, bit1=TimerB) */
 static uint8_t  ym_adpcm_status;  /* status register 1 (bit7=ADPCM-B EOS, bits0-5=ADPCM-A end) */
+static uint8_t  ym_flag_mask = 0xBF;  /* reg $1C: masks EOS flags from status reads */
 static uint8_t  timer_irq_ena;    /* bits: 0=Timer A IRQ, 1=Timer B IRQ */
 
 #define TIMER_A_PERIOD(v)  (36 * (1024 - (v)))
@@ -117,7 +118,8 @@ static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
 static uint32_t stat_nonzero;
 static uint32_t stat_ssg_nonzero;
-static uint32_t stat_adpcma_keyons, stat_adpcma_ends, stat_adpcma_nonzero;        /* non-zero output samples since last dump */
+static uint32_t stat_adpcma_keyons, stat_adpcma_ends, stat_adpcma_nonzero;
+static uint32_t stat_adpcmb_keyons, stat_adpcmb_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
 static uint32_t stat_port_rhist[256]; /* per-port IN histogram */
 static uint8_t stat_p04_vals[16];   /* first unique values written to $04 */
@@ -146,9 +148,10 @@ void sound_debug_stats(void)
 		(unsigned long)stat_keyon_writes,
 		(unsigned long)z80_pc,
 		(unsigned long)z80_sp);
-	debugf("[SND] audio: peak=%ld nonzero=%lu ssg=%lu adpcmA(keyon=%lu end=%lu nz=%lu) fm_ch_en=%d%d%d%d\n",
+	debugf("[SND] audio: peak=%ld nonzero=%lu ssg=%lu adpcmA(keyon=%lu end=%lu nz=%lu) adpcmB(keyon=%lu nz=%lu) fm_ch_en=%d%d%d%d\n",
 		(long)stat_peak, (unsigned long)stat_nonzero, (unsigned long)stat_ssg_nonzero,
 		(unsigned long)stat_adpcma_keyons, (unsigned long)stat_adpcma_ends, (unsigned long)stat_adpcma_nonzero,
+		(unsigned long)stat_adpcmb_keyons, (unsigned long)stat_adpcmb_nonzero,
 		fm_state.ch[0].enabled, fm_state.ch[1].enabled,
 		fm_state.ch[2].enabled, fm_state.ch[3].enabled);
 	if (cmd_log_printed < stat_cmd_count) {
@@ -159,7 +162,7 @@ void sound_debug_stats(void)
 		cmd_log_printed = stat_cmd_count;
 	}
 	stat_peak = 0; stat_nonzero = 0; stat_ssg_nonzero = 0;
-	stat_adpcma_nonzero = 0;
+	stat_adpcma_nonzero = 0; stat_adpcmb_nonzero = 0;
 
 	/* Find top 6 ports by write count */
 	int top[6] = {-1,-1,-1,-1,-1,-1};
@@ -272,7 +275,7 @@ static UINT8 z80_port_read(UINT16 fullport)
 	case 0x04: /* YM2610 status port 1 (timer flags) */
 		return ym_status;
 	case 0x06: /* YM2610 status port 2 (ADPCM flags) */
-		return ym_adpcm_status;
+		return ym_adpcm_status & ym_flag_mask;
 	case 0x08: z80_bank_off[0] = ((uint32_t)hi * 0x0800) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
 	case 0x09: z80_bank_off[1] = ((uint32_t)hi * 0x1000) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
 	case 0x0A: z80_bank_off[2] = ((uint32_t)hi * 0x2000) & (Z80_ROM_SIZE - 1); z80_map_banks(); return 0;
@@ -891,6 +894,138 @@ static int32_t adpcma_sample(void)
 	return mix >> ADPCMA_GAIN_SHIFT;
 }
 
+
+/* ---- ADPCM-B: single delta-T ADPCM channel (ported from ymfm) ----
+ *
+ * 16-bit accumulator, adaptive step, playback rate = delta_n/65536 * 55.5 kHz
+ * (8 MHz / 144).  Reads from the same V ROM as ADPCM-A. */
+
+#define ADPCMB_STEP_MIN   127
+#define ADPCMB_STEP_MAX   24576
+#define ADPCMB_ST_EOS     0x01
+#define ADPCMB_ST_PLAYING 0x04
+#define ADPCMB_CLK_Q16    165119u         /* 55555.6 / 22050 * 65536 B-clocks per output sample */
+
+static uint8_t  adpcmb_reg[16];           /* regs $10..$1B, index = addr - $10 */
+static uint8_t  adpcmb_status;
+static uint8_t  adpcmb_nibble, adpcmb_byte;
+static uint32_t adpcmb_pos16, adpcmb_addr, adpcmb_clk_acc;
+static int32_t  adpcmb_acc, adpcmb_prev, adpcmb_step;
+static uint32_t adpcmb_chunk_base = ~0u;
+static uint8_t  adpcmb_buf[ADPCMA_CHUNK] __attribute__((aligned(16)));
+
+static inline int adpcmb_fetch(uint32_t addr)
+{
+	uint32_t base = addr & ~(uint32_t)(ADPCMA_CHUNK - 1);
+	if (adpcmb_chunk_base != base) {
+		vrom_read(base, adpcmb_buf, ADPCMA_CHUNK);
+		adpcmb_chunk_base = base;
+	}
+	return adpcmb_buf[addr & (ADPCMA_CHUNK - 1)];
+}
+
+static inline uint32_t adpcmb_start(void)   { return adpcmb_reg[2] | ((uint32_t)adpcmb_reg[3] << 8); }
+static inline uint32_t adpcmb_end(void)     { return adpcmb_reg[4] | ((uint32_t)adpcmb_reg[5] << 8); }
+static inline uint32_t adpcmb_delta_n(void) { return adpcmb_reg[9] | ((uint32_t)adpcmb_reg[10] << 8); }
+
+static void adpcmb_load_start(void)
+{
+	adpcmb_status = (adpcmb_status & ~ADPCMB_ST_EOS) | ADPCMB_ST_PLAYING;
+	adpcmb_addr = adpcmb_start() << 8;
+	adpcmb_nibble = 0; adpcmb_byte = 0; adpcmb_pos16 = 0;
+	adpcmb_acc = adpcmb_prev = 0; adpcmb_step = ADPCMB_STEP_MIN;
+	adpcmb_chunk_base = ~0u;
+}
+
+static void adpcmb_reset(void)
+{
+	adpcmb_status = 0;
+	adpcmb_nibble = 0; adpcmb_byte = 0; adpcmb_pos16 = 0; adpcmb_addr = 0;
+	adpcmb_acc = adpcmb_prev = 0; adpcmb_step = ADPCMB_STEP_MIN;
+}
+
+/* One ADPCM-B clock (55.5 kHz) */
+static void adpcmb_clock(void)
+{
+	if (!(adpcmb_reg[0] & 0x80) || !(adpcmb_status & ADPCMB_ST_PLAYING)) {
+		adpcmb_status &= ~ADPCMB_ST_PLAYING;
+		return;
+	}
+	uint32_t position = adpcmb_pos16 + adpcmb_delta_n();
+	adpcmb_pos16 = position & 0xFFFF;
+	if (position < 0x10000) return;
+
+	if (adpcmb_nibble == 0)
+		adpcmb_byte = (uint8_t)adpcmb_fetch(adpcmb_addr);
+	int data = (uint8_t)(adpcmb_byte << (4 * adpcmb_nibble)) >> 4;
+	adpcmb_nibble ^= 1;
+
+	if (adpcmb_nibble == 0) {                          /* finished a byte */
+		if (adpcmb_addr == (((adpcmb_end() + 1) << 8) - 1)) {
+			if (adpcmb_reg[0] & 0x10) {                /* repeat */
+				adpcmb_load_start();
+			} else {                                   /* done: raise EOS */
+				adpcmb_acc = adpcmb_prev = 0;
+				adpcmb_status = (adpcmb_status & ~ADPCMB_ST_PLAYING) | ADPCMB_ST_EOS;
+				return;
+			}
+		} else {
+			adpcmb_addr = (adpcmb_addr + 1) & 0xFFFFFF;
+		}
+	}
+
+	adpcmb_prev = adpcmb_acc;
+	int d = (2 * (data & 7) + 1) * adpcmb_step / 8;
+	if (data & 8) d = -d;
+	adpcmb_acc += d;
+	if (adpcmb_acc > 32767) adpcmb_acc = 32767; else if (adpcmb_acc < -32768) adpcmb_acc = -32768;
+	static const uint8_t scale[8] = { 57, 57, 57, 57, 77, 102, 128, 153 };
+	adpcmb_step = (adpcmb_step * scale[data & 7]) / 64;
+	if (adpcmb_step < ADPCMB_STEP_MIN) adpcmb_step = ADPCMB_STEP_MIN;
+	else if (adpcmb_step > ADPCMB_STEP_MAX) adpcmb_step = ADPCMB_STEP_MAX;
+}
+
+static void adpcmb_write(uint8_t regnum, uint8_t val)
+{
+	if (regnum == 0) val = (val | 0x20) & ~0x40;     /* YM2610: external mode forced on, no record */
+	adpcmb_reg[regnum & 15] = val;
+	if (regnum == 0) {
+		if (val & 0x80) {
+			adpcmb_load_start();
+			stat_adpcmb_keyons++;
+#ifdef N64
+			if (stat_adpcmb_keyons <= 20)
+				debugf("[ADPCMB] start=%04x end=%04x dn=%04x lvl=%02x pan=%02x rep=%d\n",
+					(unsigned)adpcmb_start(), (unsigned)adpcmb_end(), (unsigned)adpcmb_delta_n(),
+					adpcmb_reg[0xB], adpcmb_reg[1] & 0xC0, (val >> 4) & 1);
+#endif
+		} else {
+			adpcmb_status &= ~ADPCMB_ST_EOS;
+		}
+		if (val & 0x01) adpcmb_reset();
+	}
+}
+
+/* One 22050 Hz output sample of ADPCM-B (signed) */
+static int32_t adpcmb_sample(void)
+{
+	adpcmb_clk_acc += ADPCMB_CLK_Q16;
+	while (adpcmb_clk_acc >= 65536) { adpcmb_clk_acc -= 65536; adpcmb_clock(); }
+
+	/* mirror the live EOS state into the visible flags (bit 6 tracks, bit 7 is seen) */
+	{
+		uint8_t live = (adpcmb_status & ADPCMB_ST_EOS) ? 0x40 : 0x00;
+		if ((live ^ ym_adpcm_status) & 0x40)
+			ym_adpcm_status = (ym_adpcm_status & ~0xC0) | live | (live << 1);
+	}
+
+	if (!(adpcmb_status & ADPCMB_ST_PLAYING) || !(adpcmb_reg[1] & 0xC0)) return 0;
+	int32_t r = (adpcmb_prev * (int32_t)((adpcmb_pos16 ^ 0xFFFF) + 1) + adpcmb_acc * (int32_t)adpcmb_pos16) >> 16;
+	r = (r * (int32_t)adpcmb_reg[0xB]) >> 9;
+	if (r) stat_adpcmb_nonzero++;
+	return r >> ADPCMA_GAIN_SHIFT;
+}
+
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 {
 	stat_reg1_writes++;
@@ -919,17 +1054,15 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 	}
 
 	if (addr == 0x1C) {
-		/* ADPCM flag control: writing resets corresponding end flags
-		 * in status register 1 (port $06 read). */
-		if (val & 0x80) ym_adpcm_status &= ~0x80; /* reset ADPCM-B EOS */
-		if (val & 0x3F) ym_adpcm_status &= ~(val & 0x3F); /* reset ADPCM-A flags */
+		/* EOS flag control: 1 bits reset the flag and mask it from reads,
+		 * 0 bits unmask (ymfm/YM2610 behaviour) */
+		ym_flag_mask = (uint8_t)(~val & 0xBF);
+		ym_adpcm_status &= (uint8_t)~(val & 0xBF);
 		return;
 	}
 
-	if (addr == 0x10) {
-		/* ADPCM-B control: bit 7 = start, bit 0 = reset.
-		 * Reset clears EOS flag; EOS is only set when playback reaches end. */
-		if (val & 0x01) ym_adpcm_status &= ~0x80; /* reset clears EOS */
+	if (addr >= 0x10 && addr <= 0x1B) {
+		adpcmb_write(addr - 0x10, val);
 		return;
 	}
 
@@ -1022,6 +1155,7 @@ void sound_init(const uint8_t *rom, int rom_size)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
 	eg_acc = 0; eg_cnt = 1;
 	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F;
+	memset(adpcmb_reg, 0, sizeof(adpcmb_reg)); adpcmb_reset(); adpcmb_clk_acc = 0; ym_flag_mask = 0xBF;
 	for (int c = 0; c < 6; c++) { adpcma[c].level = 0x1F; adpcma[c].pan = 0xC0; }
 	memset(ssg_reg, 0, sizeof(ssg_reg)); memset(ssg_cnt, 0, sizeof(ssg_cnt)); memset(ssg_tone, 0, sizeof(ssg_tone));
 	ssg_noise_cnt = 0; ssg_lfsr = 1; ssg_noise_bit = 0; ssg_dc = 0; ssg_env_restart();
@@ -1145,7 +1279,7 @@ void sound_update(int cycles)
 		 * music command $5F. Frame numbers are sound_update() calls. */
 		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
 			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
-			{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},
+			{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},{620,0x80},
 		};
 		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
 			if (stat_update_calls == tl[i].fr) snd_cmd(tl[i].cmd);
@@ -1294,7 +1428,7 @@ int sound_render(int16_t *buf, int max_samples)
 	for (int i = 0; i < nsamples; i++) {
 		int32_t ssg = ssg_sample();
 		if (ssg) stat_ssg_nonzero++;
-		int32_t s = fm_output[i] * FM_GAIN + ssg + adpcma_sample();
+		int32_t s = fm_output[i] * FM_GAIN + ssg + adpcma_sample() + adpcmb_sample();
 		if (s > 32767) s = 32767;
 		if (s < -32768) s = -32768;
 		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
