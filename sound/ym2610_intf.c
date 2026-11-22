@@ -353,6 +353,11 @@ typedef struct {
 	uint8_t  rr;       /* release rate (0-15) */
 	uint8_t  sl;       /* sustain level (0-15) */
 	uint8_t  key_on;   /* key state */
+	/* Envelope generator */
+	uint8_t  eg_state; /* EG_OFF / EG_ATT / EG_DEC / EG_SUS / EG_REL */
+	uint16_t env;      /* current attenuation 0 (loud) .. 0x3FF (silent) */
+	uint8_t  r_ar, r_d1r, r_d2r, r_rr;  /* effective rates 0..63 incl. key scaling (0 = never) */
+	uint16_t sl_lvl;   /* decay->sustain switch level in env units */
 } ym_slot_t;
 
 /* Per-channel state */
@@ -371,6 +376,126 @@ static ym_chan_t ym_ch[4]; /* 4 FM channels for YM2610 */
  * YM2610 slot ordering: 0→M1, 1→M2, 2→C1, 3→C2
  * (different from logical order — inherited from OPN family) */
 static const int slot_map[4] = { 0, 2, 1, 3 };
+
+
+/* ---- Envelope generator (OPN: 10-bit attenuation, 0.09375 dB/unit) ---- */
+
+enum { EG_OFF = 0, EG_ATT, EG_DEC, EG_SUS, EG_REL };
+#define EG_MAX 0x3FF
+
+/* Increment patterns, indexed by (eg_cnt >> shift) & 7 */
+static const uint8_t eg_pat_lo[4][8] = {   /* rates 0..47 (groups 0..11) */
+	{0,1,0,1,0,1,0,1}, {0,1,0,1,1,1,0,1}, {0,1,1,1,0,1,1,1}, {0,1,1,1,1,1,1,1},
+};
+static const uint8_t eg_pat_hi[4][8] = {   /* rates 48..51 (group 12), x2 per group above */
+	{1,1,1,1,1,1,1,1}, {1,1,1,2,1,1,1,2}, {1,2,1,2,1,2,1,2}, {1,2,2,2,1,2,2,2},
+};
+
+/* One EG tick = 3 native samples = 3 * 144 / 8 MHz; per 22050 Hz output sample
+ * that is (8e6/144/3)/22050 = 0.83987 ticks (Q16). */
+#define EG_TICKS_PER_SAMPLE_Q16  55042u
+static uint32_t eg_acc;
+static uint32_t eg_cnt = 1;
+
+static inline int eg_rate_eff(int base, int ks, int kc)
+{
+	if (base == 0) return 0;                 /* R=0: envelope never moves */
+	int r = base + (kc >> (3 - ks));
+	return r > 63 ? 63 : r;
+}
+
+/* Increment for one EG tick at effective rate r (0 = none) */
+static inline int eg_step(int r)
+{
+	if (r < 2) return 0;
+	int g = r >> 2, sub = r & 3;
+	if (g < 12) {
+		int sh = 11 - g;
+		if (eg_cnt & ((1u << sh) - 1)) return 0;
+		return eg_pat_lo[sub][(eg_cnt >> sh) & 7];
+	}
+	if (g == 15) return (r >= 60) ? 8 : eg_pat_hi[sub][eg_cnt & 7] * 8;
+	return eg_pat_hi[sub][eg_cnt & 7] << (g - 12);
+}
+
+static void eg_tick_slot(ym_slot_t *s)
+{
+	switch (s->eg_state) {
+	case EG_ATT: {
+		int inc = eg_step(s->r_ar);
+		if (inc) {
+			s->env += (int)(((~(int)s->env) * inc) >> 4);
+			if ((int16_t)s->env <= 0) { s->env = 0; s->eg_state = EG_DEC; }
+		}
+		break; }
+	case EG_DEC: {
+		s->env += eg_step(s->r_d1r);
+		if (s->env >= s->sl_lvl) s->eg_state = EG_SUS;
+		break; }
+	case EG_SUS:
+		s->env += eg_step(s->r_d2r);
+		if (s->env >= EG_MAX) { s->env = EG_MAX; s->eg_state = EG_OFF; }
+		break;
+	case EG_REL:
+		s->env += eg_step(s->r_rr);
+		if (s->env >= EG_MAX) { s->env = EG_MAX; s->eg_state = EG_OFF; }
+		break;
+	default: break;
+	}
+}
+
+/* Advance every slot's envelope by the time of nsamples output samples */
+static void eg_run(int nsamples)
+{
+	eg_acc += (uint32_t)nsamples * EG_TICKS_PER_SAMPLE_Q16;
+	uint32_t ticks = eg_acc >> 16;
+	eg_acc &= 0xFFFF;
+	while (ticks--) {
+		for (int c = 0; c < 4; c++)
+			for (int o = 0; o < 4; o++) {
+				ym_slot_t *s = &ym_ch[c].slot[o];
+				if (s->eg_state != EG_OFF) eg_tick_slot(s);
+			}
+		eg_cnt++;
+	}
+}
+
+static inline uint16_t slot_vol(const ym_slot_t *s)
+{
+	if (s->eg_state == EG_OFF) return EG_MAX;
+	int v = s->env + (s->tl << 3);
+	return v > EG_MAX ? EG_MAX : v;
+}
+
+/* Push envelope-derived volumes + enable flags into the RSP state */
+static void eg_push(void)
+{
+	for (int c = 0; c < 4; c++) {
+		ym_chan_t *ch = &ym_ch[c];
+		struct rsp_fm_chan *rch = &fm_state.ch[c];
+		int on = 0;
+		for (int o = 0; o < 4; o++) {
+			rch->vol_out[o] = slot_vol(&ch->slot[o]);
+			if (ch->slot[o].eg_state != EG_OFF) on = 1;
+		}
+		rch->enabled = on;
+	}
+}
+
+/* Key on/off for one slot */
+static void slot_key(int ch_idx, int op, int on)
+{
+	ym_slot_t *s = &ym_ch[ch_idx].slot[op];
+	if (on && !s->key_on) {
+		s->key_on = 1;
+		fm_state.ch[ch_idx].phase[op] = 0;          /* phase restarts on key-on */
+		if (s->r_ar >= 62) { s->env = 0; s->eg_state = EG_DEC; }   /* instant attack */
+		else               { s->eg_state = EG_ATT; }
+	} else if (!on && s->key_on) {
+		s->key_on = 0;
+		if (s->eg_state != EG_OFF) s->eg_state = EG_REL;
+	}
+}
 
 /* Update the rsp_fm_state for one channel from CPU-side state */
 static void update_fm_channel(int ch_idx)
@@ -412,14 +537,14 @@ static void update_fm_channel(int ch_idx)
 		rch->phase[op] = rch->phase[op]; /* preserve running phase */
 		rch->incr[op] = inc;
 
-		/* Volume: total level → attenuation.
-		 * For now, use TL directly as envelope value.
-		 * Full envelope (ADSR) will modulate this per-sample on CPU
-		 * and update vol_out before each RSP render call. */
-		if (sl->key_on)
-			rch->vol_out[op] = sl->tl << 3; /* scale TL to envelope range */
-		else
-			rch->vol_out[op] = 0x3FF; /* max attenuation = silent */
+		/* Envelope rates (with key scaling) and sustain level */
+		sl->r_ar  = eg_rate_eff(2 * sl->ar,  sl->ks, kc);
+		sl->r_d1r = eg_rate_eff(2 * sl->d1r, sl->ks, kc);
+		sl->r_d2r = eg_rate_eff(2 * sl->d2r, sl->ks, kc);
+		sl->r_rr  = eg_rate_eff(4 * sl->rr + 2, sl->ks, kc);
+		sl->sl_lvl = (sl->sl == 15 ? 31 : sl->sl) << 5;
+
+		rch->vol_out[op] = slot_vol(sl);
 	}
 
 	/* Algorithm routing */
@@ -433,8 +558,12 @@ static void update_fm_channel(int ch_idx)
 	/* Feedback */
 	rch->fb_shift = ch->fb ? (ch->fb + 6) : 0;
 
-	/* Channel active */
-	rch->enabled = ch->active;
+	/* Channel active while any operator's envelope is still running */
+	{
+		int on = 0;
+		for (int o = 0; o < 4; o++) if (ch->slot[o].eg_state != EG_OFF) on = 1;
+		rch->enabled = on;
+	}
 }
 
 /* Write to a FM operator register.
@@ -518,10 +647,11 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 		if (c == 0 || c == 3 || c == 4 || c == 7) return;
 		int ch_idx = ((c & 3) - 1) + ((c & 4) ? 2 : 0);
 		ym_chan_t *ch = &ym_ch[ch_idx];
-		ch->slot[0].key_on = (val >> 4) & 1;
-		ch->slot[1].key_on = (val >> 5) & 1;
-		ch->slot[2].key_on = (val >> 6) & 1;
-		ch->slot[3].key_on = (val >> 7) & 1;
+		update_fm_channel(ch_idx);                 /* make sure rates are current */
+		slot_key(ch_idx, 0, (val >> 4) & 1);
+		slot_key(ch_idx, 1, (val >> 5) & 1);
+		slot_key(ch_idx, 2, (val >> 6) & 1);
+		slot_key(ch_idx, 3, (val >> 7) & 1);
 		ch->active = (val >> 4) != 0;
 		update_fm_channel(ch_idx);
 		return;
@@ -629,6 +759,10 @@ void sound_init(const uint8_t *rom, int rom_size)
 	memset(z80_rom, 0, sizeof(z80_rom));
 	memset(z80_ram, 0, sizeof(z80_ram));
 	memset(&fm_state, 0, sizeof(fm_state));
+	memset(ym_ch, 0, sizeof(ym_ch));
+	for (int c = 0; c < 4; c++)
+		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
+	eg_acc = 0; eg_cnt = 1;
 
 	timer_a_val = 0;
 	timer_b_val = 0;
@@ -785,6 +919,12 @@ static void setup_test_fm_channel(void)
 	rch->enabled   = 1;
 }
 
+/* FM output gain: 4 channels of 14-bit-ish operator output are far below full
+ * scale on their own; this is the (provisional) mixer level. */
+#ifndef FM_GAIN
+#define FM_GAIN 6
+#endif
+
 int sound_render(int16_t *buf, int max_samples)
 {
 	stat_frames++;
@@ -829,13 +969,21 @@ int sound_render(int16_t *buf, int max_samples)
 	 * frame into equal chunks (each a multiple of 2 samples = 8-byte DMA aligned).
 	 * Channel phases carry over between chunks through fm_state. */
 	{
-		int chunks = (nsamples + 255) / 256;
-		int per = ((nsamples + chunks - 1) / chunks + 1) & ~1;
+		/* Chunk = envelope update interval (also bounded by the RSP's 256-sample
+		 * work buffer).  Must be even so each chunk's output stays 8-byte aligned. */
+		#ifndef EG_CHUNK
+		#define EG_CHUNK 92
+		#endif
+		int per = EG_CHUNK;
 		int off = 0;
 		while (off < nsamples) {
 			int n = nsamples - off;
 			if (n > per) n = per;
 			fm_state.num_samples = n;
+#if SOUND_DEBUG_MODE != 3
+			eg_run(n);
+			eg_push();
+#endif
 			rsp_fm_render(&fm_state, fm_output + off);
 			rspq_wait();
 			/* RSP wrote the phases back to RDRAM: drop our stale cached copy. */
@@ -847,11 +995,13 @@ int sound_render(int16_t *buf, int max_samples)
 	data_cache_hit_invalidate(fm_output, (nsamples * sizeof(int32_t) + 15) & ~15);
 #else
 	memset(fm_output, 0, nsamples * sizeof(int32_t));
+	eg_run(nsamples);      /* keep envelope state advancing on host builds */
+	eg_push();
 #endif
 
 	/* Convert 32-bit mono → 16-bit stereo */
 	for (int i = 0; i < nsamples; i++) {
-		int32_t s = fm_output[i];
+		int32_t s = fm_output[i] * FM_GAIN;
 		if (s > 32767) s = 32767;
 		if (s < -32768) s = -32768;
 		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
