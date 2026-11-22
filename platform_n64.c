@@ -58,6 +58,29 @@ int plat_poll(void) {
     if (ckeys.btn.c_right)  { keystate[PLAT_KEY_P1_D] = 1; }
     if (ckeys.btn.start)    { keystate[PLAT_KEY_P1_START] = 1; }
 
+#ifdef AUTOPLAY
+    /* Scripted input for unattended testing (make ... SND_CFLAGS=-DAUTOPLAY):
+     * pulse COIN+START (and A for menus) every 2 s once booted, then play:
+     * autofire on A, weave up/down/left/right, bomb with B now and then. */
+    {
+        static uint32_t f;
+        f++;
+        if (f > 600) {
+            uint32_t t = f % 120;
+            if (t < 6)              keystate[PLAT_KEY_COIN_1] = 1;
+            if (t >= 20 && t < 26)  keystate[PLAT_KEY_P1_START] = 1;
+            if (t >= 50 && t < 56)  keystate[PLAT_KEY_P1_A] = 1;
+            if ((f & 7) < 4)        keystate[PLAT_KEY_P1_A] = 1;        /* autofire */
+            uint32_t m = (f / 45) % 8;                                  /* weave */
+            if (m == 1 || m == 2) keystate[PLAT_KEY_P1_UP] = 1;
+            if (m == 5 || m == 6) keystate[PLAT_KEY_P1_DOWN] = 1;
+            if (m == 3)           keystate[PLAT_KEY_P1_RIGHT] = 1;
+            if (m == 7)           keystate[PLAT_KEY_P1_LEFT] = 1;
+            if ((f % 900) < 4)    keystate[PLAT_KEY_P1_B] = 1;           /* bomb */
+        }
+    }
+#endif
+
     return 1;
 }
 

@@ -46,6 +46,13 @@ void sound_reset(void);
  * Called from emu.c's frame loop. */
 void sound_update(int cycles);
 
+/* Real-time audio (N64): call sound_frame_begin() before each emulated frame
+ * and sound_pump() after it.  sound_pump() fills every free audio-interface
+ * buffer, running the Z80/YM2610 for exactly that much audio time, and returns
+ * the number of samples pushed. */
+void sound_frame_begin(void);
+int sound_pump(void);
+
 /* Catch the Z80 up to the 68K's position within the current frame
  * (master_clock_in_frame in 24 MHz units).  Call before touching the
  * command/reply latches from the 68K side. */

@@ -101,7 +101,7 @@ static struct {
 	uint8_t pad[256 - sizeof(struct rsp_fm_state)];
 } __attribute__((aligned(16))) fm_wrap;
 #define fm_state (fm_wrap.st)
-static int32_t __attribute__((aligned(16))) fm_output[512]; /* max samples per frame (16-byte aligned for cache ops) */
+static int32_t __attribute__((aligned(16))) fm_output[1024]; /* max samples per frame (16-byte aligned for cache ops) */
 
 /* Diagnostic counters */
 static uint32_t stat_cmd_count;      /* 68K commands sent to Z80 */
@@ -118,6 +118,10 @@ static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
 static uint32_t stat_nonzero;
 static uint32_t stat_ssg_nonzero;
+static uint32_t prof_z80, prof_rsp, prof_mix, prof_ssg, prof_a, prof_b;
+static uint32_t stat_underruns, stat_pumped;
+static int32_t  pk_fm, pk_ssg, pk_a, pk_b;      /* per-source peak |sample| per stats period */
+static uint32_t stat_clipped;                    /* output samples clamped */   /* AI found fully drained / samples pushed */   /* N64 ticks spent per stats period */
 static uint32_t stat_adpcma_keyons, stat_adpcma_ends, stat_adpcma_nonzero;
 static uint32_t stat_adpcmb_keyons, stat_adpcmb_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
@@ -160,6 +164,21 @@ void sound_debug_stats(void)
 			debugf(" %02x", cmd_log[cmd_log_printed]);
 		debugf("\n");
 		cmd_log_printed = stat_cmd_count;
+	}
+	{
+		static uint32_t last; uint32_t now = TICKS_READ();
+		uint32_t span = last ? TICKS_DISTANCE(last, now) : TICKS_PER_SECOND;
+		last = now;
+		debugf("[SND] cost: z80=%.1f%% rsp_fm=%.1f%% mix(ssg+adpcm)=%.1f%% of real time | pushed=%lu underruns=%lu\n",
+			prof_z80 * 100.f / span, prof_rsp * 100.f / span, prof_mix * 100.f / span,
+			(unsigned long)stat_pumped, (unsigned long)stat_underruns);
+		stat_pumped = 0;
+		debugf("[SND] peaks: fm=%ld ssg=%ld adpcmA=%ld adpcmB=%ld clipped=%lu\n",
+			(long)pk_fm, (long)pk_ssg, (long)pk_a, (long)pk_b, (unsigned long)stat_clipped);
+		pk_fm = pk_ssg = pk_a = pk_b = 0; stat_clipped = 0;
+		debugf("[SND] mix split: ssg=%.1f%% adpcmA=%.1f%% adpcmB=%.1f%%\n",
+			prof_ssg * 100.f / span, prof_a * 100.f / span, prof_b * 100.f / span);
+		prof_z80 = prof_rsp = prof_mix = prof_ssg = prof_a = prof_b = 0;
 	}
 	stat_peak = 0; stat_nonzero = 0; stat_ssg_nonzero = 0;
 	stat_adpcma_nonzero = 0; stat_adpcmb_nonzero = 0;
@@ -335,17 +354,21 @@ static const int32_t dt_tab[4 * 32] = {
 /* DT3 */ 2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,17,19,20,22,22,22,22
 };
 
-/* Algorithm routing decomposition table.
- * For each of 8 algorithms, gives: c1_mod, m2_mod, c2_mod, out_flags, mem_src */
+/* Algorithm routing for the RSP: {c1_mod, m2_mod, c2_mod, out_flags, mem_src}
+ *   c1_mod 1: C1 <- op1          m2_mod 1: M2 <- mem (previous sample)
+ *   c2_mod 1: M2   2: op1+M2   3: mem+M2   4: op1
+ *   out_flags: bit0 op1, bit1 C1, bit2 M2, bit3 C2
+ *   mem_src 1: C1   2: op1+C1   3: op1   (stored for the next sample)
+ * Checked against ymfm's s_algorithm_ops (O1=M1 O2=C1 O3=M2 O4=C2). */
 static const uint8_t algo_table[8][5] = {
-	/* algo 0: M1→C1→M2→C2 */       {1, 1, 1, 8,  1},
-	/* algo 1: (M1+C1)→M2→C2 */     {0, 1, 1, 8,  2},
-	/* algo 2: (M1+(C1→M2))→C2 */   {0, 0, 3, 8,  3},
-	/* algo 3: ((M1→C1)+M2)→C2 */   {1, 0, 1, 8,  1},
-	/* algo 4: (M1→C1)+(M2→C2) */   {1, 0, 1, 12, 0},
-	/* algo 5: M1→(C1+M2+C2) */     {1, 1, 1, 14, 0},
-	/* algo 6: (M1→C1)+M2+C2 */     {1, 0, 0, 14, 0},
-	/* algo 7: M1+C1+M2+C2 */       {0, 0, 0, 15, 0},
+	/* 0: O1->O2->O3->O4           */ {1, 1, 1,  8, 1},
+	/* 1: (O1+O2)->O3->O4          */ {0, 1, 1,  8, 2},
+	/* 2: (O1+(O2->O3))->O4        */ {0, 1, 2,  8, 1},
+	/* 3: ((O1->O2)+O3)->O4        */ {1, 0, 3,  8, 1},
+	/* 4: (O1->O2)+(O3->O4)        */ {1, 0, 1, 10, 0},
+	/* 5: O1->O2, O1->O3, O1->O4   */ {1, 1, 4, 14, 3},
+	/* 6: (O1->O2)+O3+O4           */ {1, 0, 0, 14, 0},
+	/* 7: O1+O2+O3+O4              */ {0, 0, 0, 15, 0},
 };
 
 /* Per-operator state */
@@ -629,12 +652,15 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 			update_fm_channel(ch_idx);
 		}
 
-	} else if (addr >= 0xB0 && addr < 0xB8) {
+	} else if (addr >= 0xB0 && addr < 0xB4) {
 		/* B0-B3: feedback / algorithm */
 		ch->fb   = (val >> 3) & 7;
 		ch->algo = val & 7;
 		update_fm_channel(ch_idx);
 	}
+	/* B4-B7: L/R output enable + LFO AMS/PMS (mono output, no LFO yet).
+	 * These used to fall into the FB/ALGO case above, so every pan write
+	 * reset the channel to algorithm 0 with no feedback. */
 }
 
 
@@ -650,44 +676,51 @@ static uint32_t ssg_cnt[3], ssg_noise_cnt, ssg_env_cnt;
 static uint8_t  ssg_tone[3];
 static uint32_t ssg_lfsr = 1;
 static uint8_t  ssg_noise_bit;
-static int      ssg_env_level, ssg_env_dir, ssg_env_stopped;
+static uint32_t ssg_env_state;      /* ymfm: 0..31 ramp position, 32 = finished/held */
 static int32_t  ssg_dc;
 
 #define SSG_TICKS_Q16   743040u   /* (250000 / 22050) * 65536 */
 
-/* 2^((n-15)/2) * 3000: AY-style 3 dB-per-step volume table */
-static const int16_t ssg_vol_tab[16] = {
-	0, 23, 33, 47, 66, 94, 133, 188, 265, 375, 530, 750, 1061, 1500, 2121, 3000
+/* Volume -> amplitude, 32 levels (ymfm, from MAME's measured table).
+ * Fixed volumes v map to level v*2|1; the envelope uses all 32. */
+static const int16_t ssg_amp[32] = {
+	    0,   32,   78,  141,  178,  222,  262,  306,
+	  369,  441,  509,  585,  701,  836,  965, 1112,
+	 1334, 1595, 1853, 2146, 2576, 3081, 3576, 4135,
+	 5000, 6006, 7023, 8155, 9963,11976,14132,16382
 };
+/* Mix level: ymfm amplitude x 0.84/0.98 (MAME's Neo Geo SSG vs FM/ADPCM routing)
+ * x 0.5 (the same /2 the ADPCM paths get) = 0.429 of ymfm's SSG output.
+ * Calibrated against ymfm with a register stimulus (110 measured 0.649). */
+#define SSG_MIX_Q8  73
 
 static void ssg_env_restart(void)
 {
-	int att = (ssg_reg[0xD] >> 2) & 1;
-	ssg_env_level   = att ? 0 : 15;
-	ssg_env_dir     = att ? 1 : -1;
-	ssg_env_stopped = 0;
-	ssg_env_cnt     = 0;
+	ssg_env_state = 0;          /* writing the shape register restarts the envelope */
+}
+
+static inline int ssg_env_held(void)
+{
+	int shape = ssg_reg[0xD];
+	return ((shape & 1) | (((shape >> 3) & 1) ^ 1));   /* hold, or no continue */
 }
 
 static void ssg_env_step(void)
 {
-	if (ssg_env_stopped) return;
-	int shape = ssg_reg[0xD] & 15;
-	int cont = (shape >> 3) & 1, att = (shape >> 2) & 1, alt = (shape >> 1) & 1, hold = shape & 1;
-	ssg_env_level += ssg_env_dir;
-	if (ssg_env_level < 0 || ssg_env_level > 15) {      /* end of one 16-step ramp */
-		if (!cont) {
-			ssg_env_level = 0; ssg_env_stopped = 1;
-		} else if (hold) {
-			ssg_env_level = (alt ^ att) ? 15 : 0;       /* final level after hold */
-			ssg_env_stopped = 1;
-		} else if (alt) {
-			ssg_env_dir = -ssg_env_dir;
-			ssg_env_level = ssg_env_dir > 0 ? 0 : 15;
-		} else {
-			ssg_env_level = ssg_env_dir > 0 ? 0 : 15;   /* restart the ramp */
-		}
+	if (ssg_env_held() && ssg_env_state >= 32) { ssg_env_state = 32; return; }
+	ssg_env_state = (ssg_env_state + 1) & 63;
+}
+
+static inline int ssg_env_volume(void)
+{
+	int shape = ssg_reg[0xD];
+	int cont = (shape >> 3) & 1, att = (shape >> 2) & 1, alt = (shape >> 1) & 1;
+	if (ssg_env_held() && ssg_env_state >= 32) {
+		ssg_env_state = 32;
+		return ((att ^ alt) & cont) ? 31 : 0;
 	}
+	if (alt) att ^= (ssg_env_state >> 5) & 1;
+	return (int)(ssg_env_state & 31) ^ (att ? 0 : 31);
 }
 
 static void ssg_write(uint8_t addr, uint8_t val)
@@ -727,20 +760,23 @@ static int32_t ssg_sample(void)
 		uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8);
 		if (!ep) ep = 1;
 		ssg_env_cnt += SSG_TICKS_Q16;
-		uint32_t thr = (ep * 2) << 16;
+		uint32_t thr = ep << 16;
 		while (ssg_env_cnt >= thr) { ssg_env_cnt -= thr; ssg_env_step(); }
 	}
 	/* mix */
 	int32_t mix = 0;
+	int envv = -1;
 	for (int c = 0; c < 3; c++) {
 		int tone_dis  = (ssg_reg[7] >> c) & 1;
 		int noise_dis = (ssg_reg[7] >> (c + 3)) & 1;
 		if ((ssg_tone[c] | tone_dis) & (ssg_noise_bit | noise_dis)) {
-			int a = ssg_reg[8 + c];
-			int v = (a & 0x10) ? ssg_env_level : (a & 15);
-			mix += ssg_vol_tab[v];
+			int a = ssg_reg[8 + c], v;
+			if (a & 0x10) { if (envv < 0) envv = ssg_env_volume(); v = envv; }
+			else          { v = (a & 15) * 2; if (v) v |= 1; }
+			mix += ssg_amp[v];
 		}
 	}
+	mix = (mix * SSG_MIX_Q8) >> 8;
 	/* remove DC (constant-high channels, volume steps) */
 	ssg_dc += ((mix << 8) - ssg_dc) >> 9;      /* Q8 running mean, no integer stall */
 	return mix - ((ssg_dc + 128) >> 8);
@@ -863,35 +899,44 @@ static void adpcma_write(uint8_t addr, uint8_t val)
 	}
 }
 
-/* One 22050 Hz output sample of all ADPCM-A channels (signed) */
-static int32_t adpcma_sample(void)
+/* Add n output samples of all ADPCM-A channels into acc */
+static void adpcma_render(int32_t *out, int n)
 {
-	int32_t mix = 0;
+	static int32_t acc[1024];
+	memset(acc, 0, n * sizeof(int32_t));
+	int any = 0;
 	for (int c = 0; c < 6; c++) {
 		adpcma_t *a = &adpcma[c];
 		if (!a->on) continue;
-		a->frac += ADPCMA_RATE_Q16;
-		while (a->frac >= 65536) {
-			a->frac -= 65536;
-			a->s0 = a->s1;
-			if (!adpcma_decode(c)) {                       /* reached the end address */
-				a->on = 0;
-				ym_adpcm_status |= (uint8_t)(1 << c);     /* end-of-sample flag */
-				stat_adpcma_ends++;
-				break;
-			}
-			a->s1 = (a->acc ^ 0x800) - 0x800;                 /* sign-extend 12 bits */
-		}
-		if (!a->on) continue;
-		/* volume = instrument level + total level attenuation; >= 63 is silent */
 		int vol = ((a->level ^ 0x1F) & 0x1F) + ((adpcma_total ^ 0x3F) & 0x3F);
-		if (vol >= 63 || !(a->pan & 0xC0)) continue;
-		int32_t v = a->s0 + (int32_t)(((int64_t)(a->s1 - a->s0) * (int32_t)a->frac) >> 16);
-		int32_t s = (((v << 4) * (15 - (vol & 7))) >> (5 + (vol >> 3))) & ~3;
-		mix += s;
+		int audible = vol < 63 && (a->pan & 0xC0);
+		int mul = 15 - (vol & 7), sh = 5 + (vol >> 3);
+		for (int i = 0; i < n; i++) {
+			a->frac += ADPCMA_RATE_Q16;
+			while (a->frac >= 65536) {
+				a->frac -= 65536;
+				a->s0 = a->s1;
+				if (!adpcma_decode(c)) {                    /* reached the end address */
+					a->on = 0;
+					ym_adpcm_status |= (uint8_t)(1 << c);  /* end-of-sample flag */
+					stat_adpcma_ends++;
+					break;
+				}
+				a->s1 = (a->acc ^ 0x800) - 0x800;           /* sign-extend 12 bits */
+			}
+			if (!a->on) break;
+			if (!audible) continue;
+			/* |s1-s0| < 4096 and frac < 65536: the product fits in 32 bits */
+			int32_t v = a->s0 + (((a->s1 - a->s0) * (int32_t)a->frac) >> 16);
+			int32_t smp = (((v << 4) * mul) >> sh) & ~3;
+			acc[i] += smp;
+			any |= smp;
+		}
 	}
-	if (mix) stat_adpcma_nonzero++;
-	return mix >> ADPCMA_GAIN_SHIFT;
+	if (any) {
+		stat_adpcma_nonzero += n;
+		for (int i = 0; i < n; i++) { int32_t v = acc[i] >> ADPCMA_GAIN_SHIFT; int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m; out[i] += v; }   /* gain on the channel sum */
+	}
 }
 
 
@@ -944,17 +989,10 @@ static void adpcmb_reset(void)
 	adpcmb_acc = adpcmb_prev = 0; adpcmb_step = ADPCMB_STEP_MIN;
 }
 
-/* One ADPCM-B clock (55.5 kHz) */
-static void adpcmb_clock(void)
+/* Decode the next ADPCM-B nibble (what one clock does when the 16-bit position
+ * counter overflows).  Returns 0 when the sample has ended (EOS raised). */
+static int adpcmb_nibble_step(void)
 {
-	if (!(adpcmb_reg[0] & 0x80) || !(adpcmb_status & ADPCMB_ST_PLAYING)) {
-		adpcmb_status &= ~ADPCMB_ST_PLAYING;
-		return;
-	}
-	uint32_t position = adpcmb_pos16 + adpcmb_delta_n();
-	adpcmb_pos16 = position & 0xFFFF;
-	if (position < 0x10000) return;
-
 	if (adpcmb_nibble == 0)
 		adpcmb_byte = (uint8_t)adpcmb_fetch(adpcmb_addr);
 	int data = (uint8_t)(adpcmb_byte << (4 * adpcmb_nibble)) >> 4;
@@ -967,7 +1005,7 @@ static void adpcmb_clock(void)
 			} else {                                   /* done: raise EOS */
 				adpcmb_acc = adpcmb_prev = 0;
 				adpcmb_status = (adpcmb_status & ~ADPCMB_ST_PLAYING) | ADPCMB_ST_EOS;
-				return;
+				return 0;
 			}
 		} else {
 			adpcmb_addr = (adpcmb_addr + 1) & 0xFFFFFF;
@@ -983,6 +1021,7 @@ static void adpcmb_clock(void)
 	adpcmb_step = (adpcmb_step * scale[data & 7]) / 64;
 	if (adpcmb_step < ADPCMB_STEP_MIN) adpcmb_step = ADPCMB_STEP_MIN;
 	else if (adpcmb_step > ADPCMB_STEP_MAX) adpcmb_step = ADPCMB_STEP_MAX;
+	return 1;
 }
 
 static void adpcmb_write(uint8_t regnum, uint8_t val)
@@ -1006,24 +1045,80 @@ static void adpcmb_write(uint8_t regnum, uint8_t val)
 	}
 }
 
-/* One 22050 Hz output sample of ADPCM-B (signed) */
-static int32_t adpcmb_sample(void)
+/* Add n output samples of ADPCM-B into acc */
+static void adpcmb_render(int32_t *acc, int n)
 {
-	adpcmb_clk_acc += ADPCMB_CLK_Q16;
-	while (adpcmb_clk_acc >= 65536) { adpcmb_clk_acc -= 65536; adpcmb_clock(); }
-
-	/* mirror the live EOS state into the visible flags (bit 6 tracks, bit 7 is seen) */
-	{
-		uint8_t live = (adpcmb_status & ADPCMB_ST_EOS) ? 0x40 : 0x00;
-		if ((live ^ ym_adpcm_status) & 0x40)
-			ym_adpcm_status = (ym_adpcm_status & ~0xC0) | live | (live << 1);
+	if (adpcmb_status & ADPCMB_ST_PLAYING) {
+		int audible = (adpcmb_reg[1] & 0xC0) != 0;
+		int32_t lvl = adpcmb_reg[0xB];
+		uint32_t dn = adpcmb_delta_n();
+		for (int i = 0; i < n; i++) {
+			/* the 2-3 chip clocks of this output sample, batched: each adds
+			 * delta_n to the 16-bit position, and each overflow decodes one nibble */
+			adpcmb_clk_acc += ADPCMB_CLK_Q16;
+			uint32_t k = adpcmb_clk_acc >> 16;
+			adpcmb_clk_acc &= 0xFFFF;
+			if (!(adpcmb_reg[0] & 0x80)) { adpcmb_status &= ~ADPCMB_ST_PLAYING; break; }
+			uint32_t total = adpcmb_pos16 + k * dn;
+			adpcmb_pos16 = total & 0xFFFF;
+			int ended = 0;
+			for (uint32_t m = total >> 16; m; m--)
+				if (!adpcmb_nibble_step()) { ended = 1; break; }
+			if (ended) break;
+			if (!audible) continue;
+			/* linear interpolation; (acc-prev) < 2^17 and pos>>1 < 2^15 fit in 32 bits */
+			int32_t r = adpcmb_prev + (((adpcmb_acc - adpcmb_prev) * (int32_t)(adpcmb_pos16 >> 1)) >> 15);
+			r = ((r * lvl) >> 9) >> ADPCMA_GAIN_SHIFT;
+			{ int32_t m2 = r < 0 ? -r : r; if (m2 > pk_b) pk_b = m2; }
+			acc[i] += r;
+		}
+		if (audible) stat_adpcmb_nonzero += n;
+	} else {
+		/* idle: keep the 55.5 kHz clock phase running so key-on timing is exact */
+		adpcmb_clk_acc = (uint32_t)(((uint64_t)adpcmb_clk_acc + (uint64_t)n * ADPCMB_CLK_Q16) & 0xFFFF);
 	}
+	/* mirror the live EOS state into the visible flags (bit 6 tracks, bit 7 is seen) */
+	uint8_t live = (adpcmb_status & ADPCMB_ST_EOS) ? 0x40 : 0x00;
+	if ((live ^ ym_adpcm_status) & 0x40)
+		ym_adpcm_status = (ym_adpcm_status & ~0xC0) | live | (live << 1);
+}
 
-	if (!(adpcmb_status & ADPCMB_ST_PLAYING) || !(adpcmb_reg[1] & 0xC0)) return 0;
-	int32_t r = (adpcmb_prev * (int32_t)((adpcmb_pos16 ^ 0xFFFF) + 1) + adpcmb_acc * (int32_t)adpcmb_pos16) >> 16;
-	r = (r * (int32_t)adpcmb_reg[0xB]) >> 9;
-	if (r) stat_adpcmb_nonzero++;
-	return r >> ADPCMA_GAIN_SHIFT;
+static void ssg_render(int32_t *acc, int n)
+{
+	int silent = 1;
+	for (int c = 0; c < 3; c++) if (ssg_reg[8 + c] & 0x1F) silent = 0;
+	if (silent && ssg_dc == 0) {
+		/* Nothing audible and DC settled: just advance the tone, noise and
+		 * envelope counters by n samples so they stay exactly in phase. */
+		uint64_t adv = (uint64_t)n * SSG_TICKS_Q16;
+		for (int c = 0; c < 3; c++) {
+			uint32_t tp = ((uint32_t)(ssg_reg[c * 2 + 1] & 15) << 8) | ssg_reg[c * 2];
+			if (!tp) tp = 1;
+			uint64_t thr = (uint64_t)tp << 16, t = ssg_cnt[c] + adv;
+			ssg_tone[c] ^= (uint8_t)((t / thr) & 1);
+			ssg_cnt[c] = (uint32_t)(t % thr);
+		}
+		{
+			uint32_t np = ssg_reg[6] & 31; if (!np) np = 1;
+			uint64_t thr = (uint64_t)(np * 2) << 16, t = ssg_noise_cnt + adv;
+			for (uint64_t k = t / thr; k; k--) {
+				uint32_t b = (ssg_lfsr ^ (ssg_lfsr >> 3)) & 1;
+				ssg_lfsr = (ssg_lfsr >> 1) | (b << 16);
+			}
+			ssg_noise_bit = ssg_lfsr & 1;
+			ssg_noise_cnt = (uint32_t)(t % thr);
+		}
+		{
+			uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8); if (!ep) ep = 1;
+			uint64_t thr = (uint64_t)ep << 16, t = ssg_env_cnt + adv;
+			uint64_t k = t / thr;
+			if (ssg_env_held()) ssg_env_state = (ssg_env_state + k >= 32) ? 32 : ssg_env_state + (uint32_t)k;
+			else                ssg_env_state = (uint32_t)((ssg_env_state + k) & 63);
+			ssg_env_cnt = (uint32_t)(t % thr);
+		}
+		return;
+	}
+	for (int i = 0; i < n; i++) { int32_t v = ssg_sample(); if (v) stat_ssg_nonzero++; int32_t m = v < 0 ? -v : v; if (m > pk_ssg) pk_ssg = m; acc[i] += v; }
 }
 
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
@@ -1143,6 +1238,9 @@ static INT32 z80_irq_callback(INT32 irqline)
 /* ---- Public API ---- */
 
 static void snd_cmd(uint8_t cmd);
+#ifdef SND_SELFTEST
+static int selftest_cap_armed;
+#endif
 
 void sound_init(const uint8_t *rom, int rom_size)
 {
@@ -1173,6 +1271,9 @@ void sound_init(const uint8_t *rom, int rom_size)
 	memset(stat_port_rhist, 0, sizeof(stat_port_rhist));
 
 	z80_has_rom = 0;
+#ifdef SND_DISABLE
+	rom_size = 0;   /* A/B performance testing: run with the sound CPU off */
+#endif
 	if (rom && rom_size > 0) {
 		int copy_size = rom_size < Z80_ROM_SIZE ? rom_size : Z80_ROM_SIZE;
 		memcpy(z80_rom, rom, copy_size);
@@ -1231,12 +1332,69 @@ void sound_reset(void)
 
 /* Z80 cycles already executed in the current frame (see sound_sync) */
 static int z80_frame_done;
+/* Z80 cycles planned for the current emulated frame.  On N64 this follows the
+ * real-time audio demand (see sound_frame_begin/sound_pump), not 1/60 s. */
+static int z80_frame_target = Z80_CLOCK / 60;
+static int32_t z80_carry;        /* cycles run beyond what rendered audio paid for */
+static int snd_plan = 368;       /* expected samples per emulated frame (smoothed) */
+
+static inline int samples_to_z80(int n)
+{
+	return (int)(((int64_t)n * Z80_CLOCK) / SND_OUTPUT_RATE);
+}
 
 /* Run the Z80 (+ YM2610 timers) for the given number of Z80 cycles, in chunks
  * so timers fire mid-frame and NMIs are delivered promptly.
  * 4000 cycles ~ 1 ms is enough granularity for Timer A/B. */
+/* Idle detection: single-step a few instructions; if the CPU comes back to an
+ * identical register state (same PC, same registers, ignoring R) without any
+ * RAM write or port access in between, it is in a loop whose outcome cannot
+ * change until an interrupt arrives.  Interrupts are only raised at chunk
+ * boundaries, so the rest of the chunk can be skipped.  Delay loops (DJNZ...)
+ * change a register every pass, so they are never mistaken for idle. */
+typedef struct { uint16_t bc, de, hl, fa, ix, iy, sp, bc2, de2, hl2, fa2, iff; uint32_t pc; } z80_snap_t;
+
+static inline void z80_snap(z80_snap_t *s)
+{
+	s->bc = z80_cpu.BC.W; s->de = z80_cpu.DE.W; s->hl = z80_cpu.HL.W; s->fa = z80_cpu.FA.W;
+	s->ix = z80_cpu.IX.W; s->iy = z80_cpu.IY.W; s->sp = z80_cpu.SP.W;
+	s->bc2 = z80_cpu.BC2.W; s->de2 = z80_cpu.DE2.W; s->hl2 = z80_cpu.HL2.W; s->fa2 = z80_cpu.FA2.W;
+	s->iff = z80_cpu.IFF.W;
+	s->pc = (uint32_t)(z80_cpu.PC - z80_cpu.BasePC);
+}
+
+static uint32_t stat_z80_idle_skipped;   /* cycles fast-forwarded */
+
+/* Returns cycles consumed (executed + skipped); never more than budget+one instruction. */
+static int z80_exec_idle_aware(int budget)
+{
+#ifndef Z80_NO_IDLE_SKIP
+	z80_snap_t s0, s1;
+	z80_snap(&s0);
+	uint32_t fx0 = stat_ram_writes + stat_port_writes + stat_port_reads;
+	int used = 0;
+	for (int i = 0; i < 24 && used < budget; i++) {
+		used += Cz80_Exec(&z80_cpu, 1);
+		if (stat_ram_writes + stat_port_writes + stat_port_reads != fx0) break;   /* side effects: busy */
+		z80_snap(&s1);
+		if (memcmp(&s0, &s1, sizeof(s0)) == 0) {
+			int rest = budget - used;
+			if (rest > 0) { stat_z80_idle_skipped += rest; used += rest; }
+			return used;
+		}
+	}
+	if (budget - used > 0) used += Cz80_Exec(&z80_cpu, budget - used);
+	return used;
+#else
+	return Cz80_Exec(&z80_cpu, budget);
+#endif
+}
+
 static void z80_run(int cycles)
 {
+#ifdef N64
+	uint32_t t0 = TICKS_READ();
+#endif
 	while (cycles > 0) {
 		int chunk = (cycles < 4000) ? cycles : 4000;
 		/* The 68K command NMI is gated by the Z80's NMI-enable port. */
@@ -1246,9 +1404,12 @@ static void z80_run(int cycles)
 			stat_nmis_fired++;
 		}
 		timers_advance(chunk);
-		Cz80_Exec(&z80_cpu, chunk);
+		z80_exec_idle_aware(chunk);
 		cycles -= chunk;
 	}
+#ifdef N64
+	prof_z80 += TICKS_DISTANCE(t0, TICKS_READ());
+#endif
 }
 
 /* Bring the Z80 up to the 68K's position in the frame.  Called by the 68K
@@ -1259,8 +1420,9 @@ static void z80_run(int cycles)
 void sound_sync(int64_t master_clock_in_frame)
 {
 	if (!z80_has_rom) return;
-	int target = (int)(master_clock_in_frame / 6);
-	if (target > Z80_CLOCK / 60) target = Z80_CLOCK / 60;
+	/* FRAME_CLOCK = 24 MHz / 60 = 400000 master clocks per emulated frame */
+	int target = (int)((master_clock_in_frame * z80_frame_target) / 400000);
+	if (target > z80_frame_target) target = z80_frame_target;
 	int delta = target - z80_frame_done;
 	if (delta > 0) {
 		z80_run(delta);
@@ -1268,29 +1430,101 @@ void sound_sync(int64_t master_clock_in_frame)
 	}
 }
 
-void sound_update(int cycles)
+/* Once per emulated frame: frame counter + (self-test) command injection */
+static void snd_frame_tick(void)
 {
-	if (!z80_has_rom) return;  /* no sound driver loaded — skip */
-
 	stat_update_calls++;
 #ifdef SND_SELFTEST
 	{
 		/* Real Blazing Star startup sequence (as sent by BIOS/game), then the
-		 * music command $5F. Frame numbers are sound_update() calls. */
+		 * music command $5F etc. Frame numbers are emulated frames. */
 		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
 			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
 			{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},{620,0x80},
 		};
 		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
-			if (stat_update_calls == tl[i].fr) snd_cmd(tl[i].cmd);
+			if (stat_update_calls == tl[i].fr) {
+				snd_cmd(tl[i].cmd);
+				if (tl[i].cmd == 0x5f) selftest_cap_armed = 1;   /* capture from the next render */
+			}
 	}
 #endif
+}
 
+/* Fixed-rate path (host builds / test harnesses): one frame = `cycles`. */
+void sound_update(int cycles)
+{
+	if (!z80_has_rom) return;  /* no sound driver loaded — skip */
+	snd_frame_tick();
 	/* Finish the frame: run whatever the 68K-side syncs did not already cover */
 	int remaining = cycles - z80_frame_done;
 	if (remaining > 0) z80_run(remaining);
 	z80_frame_done = 0;
 }
+
+/* ---- Real-time path (N64) ----
+ *
+ * Sound runs on the audio clock, not on emulated frames: when the emulator is
+ * slower than 60 FPS the 68K (and so the game) runs slow, but the Z80, the
+ * YM2610 timers and the sample generators still advance exactly as much as the
+ * audio interface plays.  Music keeps its tempo and pitch, and the AI never
+ * starves; only the arrival of 68K commands follows the game's speed.
+ *
+ *   sound_frame_begin()  before emu_run_frame(): plan this frame's Z80 budget
+ *   sound_sync()         from the 68K sound port, inside the frame
+ *   sound_pump()         after the frame: fill every free AI buffer       */
+
+void sound_frame_begin(void)
+{
+	if (!z80_has_rom) return;
+	snd_frame_tick();
+	int t = samples_to_z80(snd_plan) - z80_carry;
+	z80_frame_target = t > 0 ? t : 0;
+	z80_frame_done = 0;
+}
+
+#ifdef N64
+/* Render one block of n samples into dst, first advancing the Z80 to the
+ * point in time the block ends at.  `rendered` = samples already rendered
+ * this frame. */
+static void pump_block(int16_t *dst, int n, int rendered)
+{
+	/* z80_carry = cycles the Z80 had already run ahead of rendered audio when
+	 * this frame began, so this frame only needs to reach (time - carry). */
+	int need = samples_to_z80(rendered + n) - z80_carry;
+	if (need > z80_frame_done) {
+		z80_run(need - z80_frame_done);
+		z80_frame_done = need;
+	}
+	sound_render(dst, n);
+}
+
+int sound_pump(void)
+{
+	if (!z80_has_rom) return 0;
+	int rendered = 0;
+	const int limit = 3 * audio_get_buffer_length();   /* bound the catch-up after a stall */
+	/* libdragon keeps 4 buffers, 2 of them queued in the AI.  Being able to
+	 * fill 3 or more at once means the AI ran out of data: an underrun. */
+
+	while (rendered < limit && audio_can_write()) {
+		int n = audio_get_buffer_length();
+		int16_t *dst = (int16_t *)audio_write_begin();
+		pump_block(dst, n, rendered);
+		audio_write_end();
+		rendered += n;
+	}
+	if (rendered >= 3 * audio_get_buffer_length()) stat_underruns++;
+	stat_pumped += rendered;
+	/* Whatever the Z80 ran beyond the audio rendered so far carries forward
+	 * (it ran ahead under sound_sync while the AI was full). */
+	z80_carry += z80_frame_done - samples_to_z80(rendered);
+	/* Smoothed expectation of samples per frame, for next frame's Z80 budget */
+	snd_plan = (snd_plan * 7 + rendered + 4) / 8;
+	if (snd_plan < 64) snd_plan = 64;
+	return rendered;
+}
+#endif
 
 static void snd_cmd(uint8_t cmd)
 {
@@ -1344,17 +1578,18 @@ static void setup_test_fm_channel(void)
 	rch->enabled   = 1;
 }
 
-/* FM output gain: 4 channels of 14-bit-ish operator output are far below full
- * scale on their own; this is the (provisional) mixer level. */
-#ifndef FM_GAIN
-#define FM_GAIN 6
+/* FM mix level.  The RSP sums carrier outputs at the chip's 13-bit operator
+ * scale; the YM2610 outputs each channel >>1 (ymfm, "OPNB is 13-bit"), and
+ * every source here gets the same x0.5 as the ADPCM paths: x0.25 overall. */
+#ifndef FM_MIX_SHIFT
+#define FM_MIX_SHIFT 2
 #endif
 
 int sound_render(int16_t *buf, int max_samples)
 {
 	stat_frames++;
 	int nsamples = max_samples;
-	if (nsamples > 512) nsamples = 512;
+	if (nsamples > 1024) nsamples = 1024;
 #if SOUND_DEBUG_MODE == 3
 	setup_test_fm_channel();   /* hardcoded FM channel through the real RSP path */
 #endif
@@ -1390,6 +1625,7 @@ int sound_render(int16_t *buf, int max_samples)
 
 #else
 #ifdef N64
+	uint32_t t_rsp = TICKS_READ();
 	/* The RSP overlay holds at most 256 output samples per render, so split the
 	 * frame into equal chunks (each a multiple of 2 samples = 8-byte DMA aligned).
 	 * Channel phases carry over between chunks through fm_state. */
@@ -1418,37 +1654,58 @@ int sound_render(int16_t *buf, int max_samples)
 	}
 	/* Invalidate cache so CPU sees RSP's DMA writes */
 	data_cache_hit_invalidate(fm_output, (nsamples * sizeof(int32_t) + 15) & ~15);
+	prof_rsp += TICKS_DISTANCE(t_rsp, TICKS_READ());
+	uint32_t t_mix = TICKS_READ();
 #else
 	memset(fm_output, 0, nsamples * sizeof(int32_t));
 	eg_run(nsamples);      /* keep envelope state advancing on host builds */
 	eg_push();
 #endif
 
-	/* Convert 32-bit mono → 16-bit stereo */
-	for (int i = 0; i < nsamples; i++) {
-		int32_t ssg = ssg_sample();
-		if (ssg) stat_ssg_nonzero++;
-		int32_t s = fm_output[i] * FM_GAIN + ssg + adpcma_sample() + adpcmb_sample();
-		if (s > 32767) s = 32767;
-		if (s < -32768) s = -32768;
-		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
-		buf[i * 2 + 0] = (int16_t)s; /* L */
-		buf[i * 2 + 1] = (int16_t)s; /* R */
+	/* Mix: FM (from the RSP) + SSG + ADPCM-A + ADPCM-B, each rendered as a block */
+	{
+		static int32_t mix[1024];
+		for (int i = 0; i < nsamples; i++) { mix[i] = fm_output[i] >> FM_MIX_SHIFT; int32_t m = mix[i] < 0 ? -mix[i] : mix[i]; if (m > pk_fm) pk_fm = m; }
+#ifdef N64
+		uint32_t q0 = TICKS_READ();
+		ssg_render(mix, nsamples);
+		uint32_t q1 = TICKS_READ();
+		adpcma_render(mix, nsamples);
+		uint32_t q2 = TICKS_READ();
+		adpcmb_render(mix, nsamples);
+		uint32_t q3 = TICKS_READ();
+		prof_ssg += TICKS_DISTANCE(q0, q1); prof_a += TICKS_DISTANCE(q1, q2); prof_b += TICKS_DISTANCE(q2, q3);
+#else
+		ssg_render(mix, nsamples);
+		adpcma_render(mix, nsamples);
+		adpcmb_render(mix, nsamples);
+#endif
+		for (int i = 0; i < nsamples; i++) {
+			int32_t s = mix[i];
+			if (s > 32767) { s = 32767; stat_clipped++; }
+			if (s < -32768) { s = -32768; stat_clipped++; }
+			if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
+			buf[i * 2 + 0] = (int16_t)s; /* L */
+			buf[i * 2 + 1] = (int16_t)s; /* R */
+		}
 	}
+#ifdef N64
+	prof_mix += TICKS_DISTANCE(t_mix, TICKS_READ());
+#endif
 
 #if defined(SND_SELFTEST) && defined(N64)
 	/* Stream 150 frames of mono output (from frame 170) to the debug log as
 	 * hex, so the waveform can be rebuilt and analysed off-target.  Streamed,
 	 * not buffered: the PB-ROM allocation leaves very little heap to spare. */
 	{
-		enum { CAP_FRAMES = 150, CAP_START = 170 };
-		static int cap_frames = 0;
-		if (stat_update_calls >= CAP_START && cap_frames < CAP_FRAMES) {
+		enum { CAP_SAMPLES = 88200 };   /* 4 s, starting with the first render after cmd $5F */
+		static int cap_n = 0;
+		if (selftest_cap_armed && cap_n < CAP_SAMPLES) {
 			static const char hx[] = "0123456789abcdef";
-			if (cap_frames == 0) debugf("[WAV] begin rate=22050\n");
-			for (int i = 0; i < nsamples; i += 46) {
+			if (cap_n == 0) debugf("[WAV] begin rate=22050\n");
+			for (int i = 0; i < nsamples && cap_n < CAP_SAMPLES; i += 46) {
 				char line[46 * 4 + 1]; int k = 0;
-				for (int j = 0; j < 46 && i + j < nsamples; j++) {
+				for (int j = 0; j < 46 && i + j < nsamples && cap_n < CAP_SAMPLES; j++, cap_n++) {
 					uint16_t v = (uint16_t)buf[(i + j) * 2];
 					line[k++] = hx[(v >> 12) & 15]; line[k++] = hx[(v >> 8) & 15];
 					line[k++] = hx[(v >> 4) & 15];  line[k++] = hx[v & 15];
@@ -1456,7 +1713,7 @@ int sound_render(int16_t *buf, int max_samples)
 				line[k] = 0;
 				debugf("[WAV] %s\n", line);
 			}
-			if (++cap_frames == CAP_FRAMES) debugf("[WAV] end\n");
+			if (cap_n >= CAP_SAMPLES) debugf("[WAV] end\n");
 		}
 	}
 #endif

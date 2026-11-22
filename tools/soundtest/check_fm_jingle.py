@@ -1,0 +1,14 @@
+"""Blazing Star FM jingle (cmd $5F) through the RSP C model vs ymfm."""
+import sys, numpy as np
+from sndlib import *
+W = sys.argv[1]; C = Checks()
+t0, N = 159 * 368, 88200
+bands = [(0, 500), (500, 1000), (1000, 2000), (2000, 4000), (4000, 11025)]
+ref = 0.5 * resample(load(f"{W}/ref_st_l.pcm"), YM_RATE, OUT_RATE)[t0:t0 + N]
+for rate, path in ((22050, "model22.pcm"), (55555.5555, "model55.pcm")):
+    x = load(f"{W}/{path}"); x = (x if rate == 22050 else resample(x, rate, OUT_RATE))[t0:t0 + N]
+    bo, br = band_shares(x, bands), band_shares(ref, bands)
+    worst = max(abs(a - b) for a, b in zip(bo, br)); lsc = log_spec_corr(x, ref); ratio = rms(x) / rms(ref)
+    C.check(f"FM jingle model@{int(rate)}", worst < 8 and lsc > 0.75 and 0.85 < ratio < 1.15,
+            f"level {ratio:.2f}, log-spectrum corr {lsc:.3f}, band shares {['%.0f%%' % v for v in bo]} vs ymfm {['%.0f%%' % v for v in br]}")
+sys.exit(C.fail)

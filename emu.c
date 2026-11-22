@@ -301,22 +301,15 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		uint32_t t0 = TICKS_READ();
 		#endif
-		emu_run_frame();
-
-		/* Run Z80 sound CPU for one frame's worth of cycles.
-		 * Z80 at 4 MHz, 60 fps → ~66667 cycles/frame. */
-		sound_update(Z80_CLOCK / 60);
-
-		/* Render audio samples and push to libdragon.
-		 * 22050 Hz / 60 fps ≈ 368 samples per frame. */
 		#ifdef N64
-		{
-			static int16_t snd_buf[512 * 2]; /* stereo */
-			int nsamples = sound_render(snd_buf, 368);
-			if (nsamples > 0) {
-				audio_push(snd_buf, nsamples, false);
-			}
-		}
+		/* Sound runs on the audio clock (see sound_pump), so music keeps its
+		 * tempo and the audio interface never starves when FPS < 60. */
+		sound_frame_begin();
+		emu_run_frame();
+		sound_pump();
+		#else
+		emu_run_frame();
+		sound_update(Z80_CLOCK / 60);
 		#endif
 
 		if (!plat_poll()) break;
