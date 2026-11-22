@@ -115,7 +115,8 @@ static uint32_t stat_ram_writes;     /* Z80 writes to RAM */
 static uint32_t stat_nmis_fired;     /* NMIs actually raised to CZ80 */
 static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
-static uint32_t stat_nonzero;        /* non-zero output samples since last dump */
+static uint32_t stat_nonzero;
+static uint32_t stat_ssg_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
 static uint32_t stat_port_rhist[256]; /* per-port IN histogram */
 static uint8_t stat_p04_vals[16];   /* first unique values written to $04 */
@@ -144,8 +145,8 @@ void sound_debug_stats(void)
 		(unsigned long)stat_keyon_writes,
 		(unsigned long)z80_pc,
 		(unsigned long)z80_sp);
-	debugf("[SND] audio: peak=%ld nonzero=%lu fm_ch_en=%d%d%d%d\n",
-		(long)stat_peak, (unsigned long)stat_nonzero,
+	debugf("[SND] audio: peak=%ld nonzero=%lu ssg=%lu fm_ch_en=%d%d%d%d\n",
+		(long)stat_peak, (unsigned long)stat_nonzero, (unsigned long)stat_ssg_nonzero,
 		fm_state.ch[0].enabled, fm_state.ch[1].enabled,
 		fm_state.ch[2].enabled, fm_state.ch[3].enabled);
 	if (cmd_log_printed < stat_cmd_count) {
@@ -155,7 +156,7 @@ void sound_debug_stats(void)
 		debugf("\n");
 		cmd_log_printed = stat_cmd_count;
 	}
-	stat_peak = 0; stat_nonzero = 0;
+	stat_peak = 0; stat_nonzero = 0; stat_ssg_nonzero = 0;
 
 	/* Find top 6 ports by write count */
 	int top[6] = {-1,-1,-1,-1,-1,-1};
@@ -630,6 +631,115 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 	}
 }
 
+
+/* ---- SSG (AY-3-8910 compatible): 3 square channels + noise + envelope ----
+ *
+ * Runs on the CPU at the 22050 Hz output rate.  The chip's SSG clock is
+ * 8 MHz / 4 = 2 MHz; tone half-periods are counted in units of clock/8
+ * (250 kHz), so f_tone = 2 MHz / (16 * period).  Noise steps every
+ * 2*NP units, the envelope every 2*EP units (16 levels per ramp). */
+
+static uint8_t  ssg_reg[16];
+static uint32_t ssg_cnt[3], ssg_noise_cnt, ssg_env_cnt;
+static uint8_t  ssg_tone[3];
+static uint32_t ssg_lfsr = 1;
+static uint8_t  ssg_noise_bit;
+static int      ssg_env_level, ssg_env_dir, ssg_env_stopped;
+static int32_t  ssg_dc;
+
+#define SSG_TICKS_Q16   743040u   /* (250000 / 22050) * 65536 */
+
+/* 2^((n-15)/2) * 3000: AY-style 3 dB-per-step volume table */
+static const int16_t ssg_vol_tab[16] = {
+	0, 23, 33, 47, 66, 94, 133, 188, 265, 375, 530, 750, 1061, 1500, 2121, 3000
+};
+
+static void ssg_env_restart(void)
+{
+	int att = (ssg_reg[0xD] >> 2) & 1;
+	ssg_env_level   = att ? 0 : 15;
+	ssg_env_dir     = att ? 1 : -1;
+	ssg_env_stopped = 0;
+	ssg_env_cnt     = 0;
+}
+
+static void ssg_env_step(void)
+{
+	if (ssg_env_stopped) return;
+	int shape = ssg_reg[0xD] & 15;
+	int cont = (shape >> 3) & 1, att = (shape >> 2) & 1, alt = (shape >> 1) & 1, hold = shape & 1;
+	ssg_env_level += ssg_env_dir;
+	if (ssg_env_level < 0 || ssg_env_level > 15) {      /* end of one 16-step ramp */
+		if (!cont) {
+			ssg_env_level = 0; ssg_env_stopped = 1;
+		} else if (hold) {
+			ssg_env_level = (alt ^ att) ? 15 : 0;       /* final level after hold */
+			ssg_env_stopped = 1;
+		} else if (alt) {
+			ssg_env_dir = -ssg_env_dir;
+			ssg_env_level = ssg_env_dir > 0 ? 0 : 15;
+		} else {
+			ssg_env_level = ssg_env_dir > 0 ? 0 : 15;   /* restart the ramp */
+		}
+	}
+}
+
+static void ssg_write(uint8_t addr, uint8_t val)
+{
+	static const uint8_t mask[16] = { 0xFF,0x0F,0xFF,0x0F,0xFF,0x0F,0x1F,0xFF,
+	                                  0x1F,0x1F,0x1F,0xFF,0xFF,0x0F,0xFF,0xFF };
+	ssg_reg[addr & 15] = val & mask[addr & 15];
+	if ((addr & 15) == 0x0D) ssg_env_restart();
+}
+
+/* One 22050 Hz output sample of SSG output (unipolar levels, DC-blocked) */
+static int32_t ssg_sample(void)
+{
+	/* tone */
+	for (int c = 0; c < 3; c++) {
+		uint32_t tp = ((uint32_t)(ssg_reg[c * 2 + 1] & 15) << 8) | ssg_reg[c * 2];
+		if (!tp) tp = 1;
+		ssg_cnt[c] += SSG_TICKS_Q16;
+		uint32_t thr = tp << 16;
+		while (ssg_cnt[c] >= thr) { ssg_cnt[c] -= thr; ssg_tone[c] ^= 1; }
+	}
+	/* noise: 17-bit LFSR, taps 0 and 3 */
+	{
+		uint32_t np = ssg_reg[6] & 31;
+		if (!np) np = 1;
+		ssg_noise_cnt += SSG_TICKS_Q16;
+		uint32_t thr = (np * 2) << 16;
+		while (ssg_noise_cnt >= thr) {
+			ssg_noise_cnt -= thr;
+			uint32_t b = (ssg_lfsr ^ (ssg_lfsr >> 3)) & 1;
+			ssg_lfsr = (ssg_lfsr >> 1) | (b << 16);
+			ssg_noise_bit = ssg_lfsr & 1;
+		}
+	}
+	/* envelope */
+	{
+		uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8);
+		if (!ep) ep = 1;
+		ssg_env_cnt += SSG_TICKS_Q16;
+		uint32_t thr = (ep * 2) << 16;
+		while (ssg_env_cnt >= thr) { ssg_env_cnt -= thr; ssg_env_step(); }
+	}
+	/* mix */
+	int32_t mix = 0;
+	for (int c = 0; c < 3; c++) {
+		int tone_dis  = (ssg_reg[7] >> c) & 1;
+		int noise_dis = (ssg_reg[7] >> (c + 3)) & 1;
+		if ((ssg_tone[c] | tone_dis) & (ssg_noise_bit | noise_dis)) {
+			int a = ssg_reg[8 + c];
+			int v = (a & 0x10) ? ssg_env_level : (a & 15);
+			mix += ssg_vol_tab[v];
+		}
+	}
+	/* remove DC (constant-high channels, volume steps) */
+	ssg_dc += ((mix << 8) - ssg_dc) >> 9;      /* Q8 running mean, no integer stall */
+	return mix - ((ssg_dc + 128) >> 8);
+}
+
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 {
 	stat_reg1_writes++;
@@ -711,6 +821,11 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 		return;
 	}
 
+	if (addr < 0x10) {
+		ssg_write(addr, val);
+		return;
+	}
+
 	if (addr >= 0x30)
 		ym_write_fm_reg(0, addr, val); /* channels 0 & 1 */
 
@@ -763,6 +878,8 @@ void sound_init(const uint8_t *rom, int rom_size)
 	for (int c = 0; c < 4; c++)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
 	eg_acc = 0; eg_cnt = 1;
+	memset(ssg_reg, 0, sizeof(ssg_reg)); memset(ssg_cnt, 0, sizeof(ssg_cnt)); memset(ssg_tone, 0, sizeof(ssg_tone));
+	ssg_noise_cnt = 0; ssg_lfsr = 1; ssg_noise_bit = 0; ssg_dc = 0; ssg_env_restart();
 
 	timer_a_val = 0;
 	timer_b_val = 0;
@@ -1001,7 +1118,9 @@ int sound_render(int16_t *buf, int max_samples)
 
 	/* Convert 32-bit mono → 16-bit stereo */
 	for (int i = 0; i < nsamples; i++) {
-		int32_t s = fm_output[i] * FM_GAIN;
+		int32_t ssg = ssg_sample();
+		if (ssg) stat_ssg_nonzero++;
+		int32_t s = fm_output[i] * FM_GAIN + ssg;
 		if (s > 32767) s = 32767;
 		if (s < -32768) s = -32768;
 		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
