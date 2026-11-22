@@ -106,6 +106,8 @@ static uint32_t stat_port_writes;    /* any Z80 OUT instruction */
 static uint32_t stat_port_reads;     /* any Z80 IN instruction */
 static uint32_t stat_ram_writes;     /* Z80 writes to RAM */
 static uint32_t stat_nmis_fired;     /* NMIs actually raised to CZ80 */
+static int32_t  stat_peak;           /* peak |sample| since last stats dump */
+static uint32_t stat_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
 static uint32_t stat_port_rhist[256]; /* per-port IN histogram */
 static uint8_t stat_p04_vals[16];   /* first unique values written to $04 */
@@ -134,6 +136,11 @@ void sound_debug_stats(void)
 		(unsigned long)stat_keyon_writes,
 		(unsigned long)z80_pc,
 		(unsigned long)z80_sp);
+	debugf("[SND] audio: peak=%ld nonzero=%lu fm_ch_en=%d%d%d%d\n",
+		(long)stat_peak, (unsigned long)stat_nonzero,
+		fm_state.ch[0].enabled, fm_state.ch[1].enabled,
+		fm_state.ch[2].enabled, fm_state.ch[3].enabled);
+	stat_peak = 0; stat_nonzero = 0;
 
 	/* Find top 6 ports by write count */
 	int top[6] = {-1,-1,-1,-1,-1,-1};
@@ -422,7 +429,8 @@ static void update_fm_channel(int ch_idx)
  * ch_pair: 0 for channels 0/1 (port 1), 1 for channels 2/3 (port 2) */
 static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 {
-	int ch_offset = (addr & 0x02) ? 1 : 0; /* bit 1 selects channel within pair */
+	if ((addr & 3) == 0 || (addr & 3) == 3) return; /* only ch1/ch2 of each port exist */
+	int ch_offset = (addr & 3) - 1;
 	int ch_idx = ch_pair * 2 + ch_offset;
 	if (ch_idx >= 4) return;
 
@@ -486,9 +494,11 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 	stat_reg1_writes++;
 	if (addr == 0x28) {
 		stat_keyon_writes++;
-		/* Key on/off — applies to all channels */
-		int ch_idx = val & 0x03;
-		if (ch_idx >= 4) return;
+		/* Key on/off. YM2610 FM channels are selected by 1,2 (port 1) and
+		 * 5,6 (port 2); 0,3,4,7 are unused. */
+		int c = val & 7;
+		if (c == 0 || c == 3 || c == 4 || c == 7) return;
+		int ch_idx = ((c & 3) - 1) + ((c & 4) ? 2 : 0);
 		ym_chan_t *ch = &ym_ch[ch_idx];
 		ch->slot[0].key_on = (val >> 4) & 1;
 		ch->slot[1].key_on = (val >> 5) & 1;
@@ -801,6 +811,7 @@ int sound_render(int16_t *buf, int max_samples)
 		int32_t s = fm_output[i];
 		if (s > 32767) s = 32767;
 		if (s < -32768) s = -32768;
+		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
 		buf[i * 2 + 0] = (int16_t)s; /* L */
 		buf[i * 2 + 1] = (int16_t)s; /* R */
 	}
