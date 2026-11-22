@@ -499,8 +499,14 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 {
 	stat_reg1_writes++;
+#ifdef HOST_REG
+	HOST_REG(1, addr, val);
+#endif
 	if (addr == 0x28) {
 		stat_keyon_writes++;
+#ifdef HOST_TRACE
+		HOST_TRACE("keyon val=%02x\n", val);
+#endif
 		/* Key on/off. YM2610 FM channels are selected by 1,2 (port 1) and
 		 * 5,6 (port 2); 0,3,4,7 are unused. */
 		int c = val & 7;
@@ -579,6 +585,9 @@ static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 static void ym2610_write_reg2(uint8_t addr, uint8_t val)
 {
 	stat_reg2_writes++;
+#ifdef HOST_REG
+	HOST_REG(2, addr, val);
+#endif
 
 	if (addr == 0x00) {
 		/* ADPCM-A dump/keyon: bit 7 = dump all, bits 0-5 = keyon mask.
@@ -723,7 +732,9 @@ uint8_t sound_result(void)
  *   2 = test buzz: alternating +/- 8000 (unmistakable, no table needed)
  *   3 = FM test: hardcoded channel setup, RSP renders (tests RSP path)
  */
+#ifndef SOUND_DEBUG_MODE
 #define SOUND_DEBUG_MODE 0
+#endif
 
 static void setup_test_fm_channel(void)
 {
@@ -750,6 +761,9 @@ int sound_render(int16_t *buf, int max_samples)
 	stat_frames++;
 	int nsamples = max_samples;
 	if (nsamples > 512) nsamples = 512;
+#if SOUND_DEBUG_MODE == 3
+	setup_test_fm_channel();   /* hardcoded FM channel through the real RSP path */
+#endif
 
 #if SOUND_DEBUG_MODE == 1
 	/* 440Hz sine wave at 22050Hz: period = 50 samples */
@@ -777,28 +791,6 @@ int sound_render(int16_t *buf, int max_samples)
 		if (++phase >= 25) { phase = 0; val = -val; }
 		buf[i*2+0] = val;
 		buf[i*2+1] = val;
-	}
-	return nsamples;
-
-#elif SOUND_DEBUG_MODE == 3
-	/* Hardcoded FM channel to test RSP synthesis path */
-	setup_test_fm_channel();
-	fm_state.num_samples = nsamples;
-	memset(fm_output, 0, nsamples * sizeof(int32_t));
-
-#ifdef N64
-	rsp_fm_render(&fm_state, fm_output);
-	rspq_wait();
-	data_cache_hit_invalidate(fm_output, (nsamples * sizeof(int32_t) + 15) & ~15);
-#endif
-
-	/* Convert 32-bit mono → 16-bit stereo, scale up to be audible */
-	for (int i = 0; i < nsamples; i++) {
-		int32_t s = fm_output[i] * 4; /* boost to hear it */
-		if (s > 32767) s = 32767;
-		if (s < -32768) s = -32768;
-		buf[i * 2 + 0] = (int16_t)s;
-		buf[i * 2 + 1] = (int16_t)s;
 	}
 	return nsamples;
 

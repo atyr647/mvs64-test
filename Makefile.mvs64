@@ -81,7 +81,7 @@ $(BUILD_DIR)/cpu/cz80/cz80.o: CFLAGS += -O2 -fno-lto
 $(BUILD_DIR)/sound/rsp_fm.o: CFLAGS += -fno-lto
 $(BUILD_DIR)/sound/rsp_audio.o: CFLAGS += -fno-lto
 $(BUILD_DIR)/sound/ym2610_intf.o: CFLAGS += -fno-lto
-CFLAGS += -Icpu/cz80 -Ipico
+CFLAGS += -Icpu/cz80 -Ipico $(SND_CFLAGS)
 
 src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c lib/rdl.c tlb_handler.c $(src_68k) $(HLE_GEN_C) $(src_drc) $(src_sound) cpu/cz80/cz80.c
 asm = tlb_vector.S
