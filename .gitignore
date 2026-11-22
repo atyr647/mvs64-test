@@ -11,3 +11,5 @@ mvsmakerom
 # HLE files are generated per-ROM by genhle at build time
 hle_*.c
 hle_index.h
+# per-ROM output of mvsmakerom (byteswapped game/BIOS data)
+*.n64/
