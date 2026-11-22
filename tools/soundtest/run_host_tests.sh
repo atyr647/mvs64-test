@@ -53,8 +53,8 @@ gcc "${CF[@]}" -DZ80_NO_IDLE_SKIP "$HERE/equiv.c" "$CZ80" -o "$W/equiv_noidle"
 
 cd "$W"; M=m1.bin; V=vrom.bin; FAIL=0
 echo; echo "== Z80 idle-loop skipping must not change the output"
-./equiv $M $V out_idle.pcm && ./equiv_noidle $M $V out_noidle.pcm
-if cmp -s out_idle.pcm out_noidle.pcm; then echo "PASS  idle skip: bit-identical over $(( $(stat -c %s out_idle.pcm) / 4 )) samples"; else echo "FAIL  idle skip changes the output"; FAIL=$((FAIL+1)); fi
+./equiv $M $V out_idle.pcm regs_idle.txt && ./equiv_noidle $M $V out_noidle.pcm regs_noidle.txt
+if cmp -s out_idle.pcm out_noidle.pcm && cmp -s regs_idle.txt regs_noidle.txt; then echo "PASS  idle skip: bit-identical over $(( $(stat -c %s out_idle.pcm) / 4 )) samples, $(wc -l < regs_idle.txt) register writes at identical Z80 cycles"; else echo "FAIL  idle skip changes the output or the register write timing"; FAIL=$((FAIL+1)); fi
 
 echo; echo "== Timer A/B periods vs ymfm (they set the music tempo)"
 if diff <(./timers) <(./ymfm_timers) >/dev/null; then echo "PASS  timer periods identical to ymfm for TA 0/1/512/900/1023, TB 0/128/192/255"

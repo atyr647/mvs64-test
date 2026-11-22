@@ -54,7 +54,7 @@ cmd_fm_init_tables:
     #   fp = channel counter (6..0)        ** NOT gp - gp is rspq_dmem_buf_ptr! **
     #   k1 = num_samples (preserved)
     #   k0 = output pointer (per sample)
-    #   t9 = sample counter
+    #   t9 = operator step counter (2 per output sample)
     #   s1 = routing value for op1
     #   s2 = C1 result
     #   s3 = M2 result
@@ -95,7 +95,7 @@ chan_loop:
     beqz    t0, chan_next
     nop
 
-    move    t9, k1                  /* sample counter */
+    sll     t9, k1, 1               /* step counter: 2 operator steps per output sample */
     li      k0, %lo(work_out)      /* output pointer */
 
 sample_loop:
@@ -378,7 +378,13 @@ no_left:
     addu    t1, t1, t0
     sw      t1, 4(k0)
 no_right:
+    /* both steps of a sample accumulate into the same slot (2x oversampling,
+     * box decimation): move on after the second (odd counter) step */
+    andi    t8, t9, 1
+    beqz    t8, same_slot
+    nop
     addiu   k0, k0, 8
+same_slot:
 
     /* ============ Advance phases (AFTER all operators) ============ */
     lw      t0, 0(v1)

@@ -19,7 +19,8 @@ static int32_t opcalc(uint32_t t5, uint16_t vol){
   int32_t o = m_exp[p & 0xFF] >> (p >> 8);
   return neg ? -o : o;
 }
-/* Render n stereo samples (int32 L,R interleaved) exactly as rsp_fm.S does.
+/* Render n stereo samples (int32 L,R interleaved) exactly as rsp_fm.S does
+ * (FM_OVERSAMPLE operator steps summed per sample).
  * scale rescales the phase increments (22050/rate) for rendering at `rate`. */
 static void model(struct rsp_fm_state *st, int32_t *out, int n, double scale){
   memset(out,0,n*8);
@@ -27,7 +28,7 @@ static void model(struct rsp_fm_state *st, int32_t *out, int n, double scale){
     struct rsp_fm_chan *ch=&st->ch[c];
     if(!ch->enabled) continue;
     uint32_t inc[4]; for(int k=0;k<4;k++) inc[k]=(uint32_t)llround(ch->incr[k]*scale);
-    for(int i=0;i<n;i++){
+    for(int j=0;j<n*FM_OVERSAMPLE;j++){ int i=j/FM_OVERSAMPLE;   /* FM_OVERSAMPLE steps per sample */
       int32_t pm=0;
       if(ch->fb_shift){ uint32_t t5=(uint32_t)ch->op1_out+((uint32_t)ch->op1_out<<16); pm=((int32_t)t5>>16)<<ch->fb_shift; }
       int32_t o1=opcalc((ch->phase[0]+pm)>>16, ch->vol_out[0]);

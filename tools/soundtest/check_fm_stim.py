@@ -9,17 +9,17 @@ mR = resample(load(f"{W}/model55_stim_r.pcm"), 55555.5555, OUT_RATE)[:n]; rR = 0
 for (s, name), (e, _) in zip(labs, labs[1:]):
     a, b = s + 10 * 368 + 2000, e - 500
     if name.startswith('F_pan'):
-        C.check(f"FM {name}", rms(m[a:b]) > 500 and rms(mR[a:b]) < 1 and rms(rR[a:b]) < 1 and abs(rms(m[a:b]) / rms(r[a:b]) - 1) < 0.25,
+        C.check(f"FM {name}", rms(m[a:b]) > 500 and rms(mR[a:b]) < 1 and rms(rR[a:b]) < 1 and abs(rms(m[a:b]) / rms(r[a:b]) - 1) < 0.06,
                 f"left {rms(m[a:b]):.0f} (ymfm {rms(r[a:b]):.0f}), right {rms(mR[a:b]):.1f} (ymfm {rms(rR[a:b]):.1f})")
         continue
     x, y = m[a:b], r[a:b]
     if name.startswith(('G_', 'H_')):
         fx, fy = peak_freq(x), peak_freq(y)
-        C.check(f"FM {name}", abs(fx - fy) < 1.0 and abs(rms(x) / rms(y) - 1) < 0.15,
+        C.check(f"FM {name}", abs(fx - fy) < 1.0 and abs(rms(x) / rms(y) - 1) < 0.05,
                 f"pitch {fx:.2f} Hz (ymfm {fy:.2f}), level {rms(x) / rms(y):.2f}")
         continue
     ratio = rms(x) / max(rms(y), 1e-9)
     px, py = peaks(x), peaks(y); common = len(set(px) & set(py))
-    lo = 0.75 if name.startswith('E_') else 0.85
-    C.check(f"FM {name}", lo < ratio < 1.15 and common >= 3, f"level {ratio:.2f}, partials ours {px} ymfm {py}")
+    tol = 0.02 if name.startswith('I_') else 0.06      # I_: a 0.75 dB EG error must fail
+    C.check(f"FM {name}", abs(ratio - 1) < tol and common >= 3, f"level {ratio:.3f}, partials ours {px} ymfm {py}")
 sys.exit(C.fail)

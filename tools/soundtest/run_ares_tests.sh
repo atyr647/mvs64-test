@@ -51,7 +51,8 @@ ares_run "$W/autoplay.z64" "$SECS" "$W/ares_autoplay.log" "$W/autoplay_audio.raw
 L="$W/ares_autoplay.log"
 n=$(grep -cE 'ASSERT|EXCEPTION' "$L" || true); [ "$n" -eq 0 ] && echo "PASS  no crashes/asserts" || { echo "FAIL  $n crash/assert lines"; FAIL=$((FAIL+1)); }
 grep -E "^\[SND\] cmds" "$L" | grep -qE " c0| f5| 18 " && echo "PASS  gameplay sound commands seen (c0/f5/18 xx)" || { echo "FAIL  game never reached gameplay"; FAIL=$((FAIL+1)); }
-und=$(grep -E "^\[SND\] cost" "$L" | tail -1 | sed 's/.*underruns=\([0-9]*\).*/\1/'); echo "INFO  AI underruns over the run: ${und:-?} (boot frames are slow in ares; a few are expected)"
+und=$(grep -E "^\[SND\] cost" "$L" | tail -1 | sed 's/.*underruns=\([0-9]*\).*/\1/'); ub=$(grep -E "^\[SND\] cost" "$L" | sed -n 10p | sed 's/.*underruns=\([0-9]*\).*/\1/')
+echo "INFO  N64 AI underruns: ${ub:-?} in the first 10 s (boot frames are slow in ares), $(( ${und:-0} - ${ub:-0} )) after"
 clip=$(grep -E "^\[SND\] peaks" "$L" | awk -F'clipped=' '{s+=$2} END{print s+0}'); [ "$clip" -eq 0 ] && echo "PASS  no clipped samples in the mixer" || { echo "FAIL  $clip clipped samples"; FAIL=$((FAIL+1)); }
 grep -E "^FPS" "$L" | awk 'NR>10{s+=$2;n++} END{if(n) printf "INFO  mean FPS after boot: %.1f\n", s/n}'
 grep -E "^\[SND\] cost" "$L" | awk -F'[=%| ]+' 'NR>40{z+=$4;r+=$6;m+=$8;n++} END{if(n) printf "INFO  sound CPU cost: %.1f%% of real time (Z80 %.1f, RSP FM %.1f, mix %.1f)\n",(z+r+m)/n,z/n,r/n,m/n}'

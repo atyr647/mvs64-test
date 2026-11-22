@@ -13,17 +13,14 @@ void vrom_read(uint32_t off,uint8_t*dst,int len){ fseek(vf,off,SEEK_SET); if(fre
 
 static FILE *tf; static long t22;
 static void W(int port,int a,int v){ fprintf(tf,"%ld %d %02x %02x\n",t22,port,a,v); if(port==1) ym2610_write_reg1(a,v); else ym2610_write_reg2(a,v); }
-static struct rsp_fm_state st; static int first=1; static double frac=0; static FILE *o;
+static double frac=0; static FILE *o;
 static void run(int frames,double rate){
   for(int f=0;f<frames;f++){
     for(int off=0;off<368;off+=92){
       eg_run(92); eg_push();
-      for(int c=0;c<4;c++){ struct rsp_fm_chan *d=&st.ch[c], *s=&fm_state.ch[c];
-        uint32_t ph[4]; memcpy(ph,d->phase,16); int32_t o1=d->op1_out, mem=d->mem;
-        *d=*s; if(!first){ memcpy(d->phase,ph,16); d->op1_out=o1; d->mem=mem; } }
-      first=0; frac+=92.0*rate/22050.0; int m=(int)frac; frac-=m;
-      static int32_t buf[2048]; model(&st,buf,m,22050.0/rate);
-      for(int i=0;i<m;i++){ int32_t v=buf[2*i]>>2; int16_t q=v>32767?32767:v<-32768?-32768:v; fwrite(&q,2,1,o);}
+      frac+=92.0*rate/22050.0; int m=(int)frac; frac-=m;
+      static int32_t buf[2048]; model(&fm_state,buf,m,22050.0/rate);   /* in place, like the RSP state DMA */
+      for(int i=0;i<m;i++){ int32_t v=buf[2*i]>>FM_MIX_SHIFT; int16_t q=v>32767?32767:v<-32768?-32768:v; fwrite(&q,2,1,o);}
     }
     t22+=368;
   }

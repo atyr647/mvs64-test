@@ -20,14 +20,14 @@ int main(int argc, char** argv) {
   FILE* tf = fopen(argv[2], "r"); FILE* oa = fopen(argv[3], "wb"); FILE* os = fopen(argv[4], "wb"); FILE* orr = argc > 7 ? fopen(argv[7], "wb") : nullptr;
   long total22 = atol(argv[5]);
   const double rate = 8000000.0 / 144;   // 55555.6 Hz
-  long t22; int p; unsigned a, v; int have = fscanf(tf, "%ld %d %x %x", &t22, &p, &a, &v) == 4;
+  double t22; int p; unsigned a, v; int have = fscanf(tf, "%lf %d %x %x", &t22, &p, &a, &v) == 4;
   long n55 = (long)(total22 * rate / 22050.0);
   ymfm::ym2610::output_data out;
   for (long i = 0; i < n55; i++) {
     double tnow22 = i * 22050.0 / rate;
     while (have && t22 <= tnow22) {
       if (p == 1) { chip.write_address(a); chip.write_data(v); } else { chip.write_address_hi(a); chip.write_data_hi(v); }
-      have = fscanf(tf, "%ld %d %x %x", &t22, &p, &a, &v) == 4;
+      have = fscanf(tf, "%lf %d %x %x", &t22, &p, &a, &v) == 4;
     }
     chip.generate(&out, 1);
     int16_t l = (int16_t)out.data[0], s = (int16_t)out.data[2];

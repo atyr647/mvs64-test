@@ -12,6 +12,6 @@ for name, ours, ref, hp, ratio_lo, ratio_hi in [
         a, b = o[s:s + 11025], r[s:s + 11025]
         if rms(b) < 20 and rms(a) < 20: continue
         cs.append(best_corr(a, b)[0]); ratios.append(rms(a) / max(rms(b), 1e-9))
-    C.check(f"{name} correlation", np.median(cs) > 0.99, f"median {np.median(cs):.4f} over {len(cs)} windows (min {min(cs):.3f})")
+    C.check(f"{name} correlation", np.median(cs) > 0.995 and min(cs) > 0.9, f"median {np.median(cs):.4f} over {len(cs)} windows (min {min(cs):.3f})")
     C.check(f"{name} level", ratio_lo < np.median(ratios) < ratio_hi, f"ours/ymfm {np.median(ratios):.3f} (expected 0.500: our deliberate x0.5)")
 sys.exit(C.fail)

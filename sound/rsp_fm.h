@@ -49,6 +49,11 @@ struct rsp_fm_state {
 }; /* 232 bytes */
 
 void rsp_fm_init(void);
+/* The RSP runs FM_OVERSAMPLE operator steps per output sample (incr[] is
+ * per step) and sums them into the output, which removes most of the
+ * aliasing of bright FM patches at 22050 Hz. rsp_fm.S hardcodes 2. */
+#define FM_OVERSAMPLE 2
+
 /* Renders state->num_samples (<= 128) stereo samples, int32 L,R interleaved. */
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);
 
