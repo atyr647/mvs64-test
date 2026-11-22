@@ -44,8 +44,10 @@ static uint8_t ym_addr1;  /* address port 1 latch */
 static uint8_t ym_addr2;  /* address port 2 latch */
 
 /* YM2610 Timer state.
- * Timer A: 10-bit, period = 72 * (1024 - TA) / 8MHz → in Z80 cycles (4 MHz): 36 * (1024 - TA)
- * Timer B:  8-bit, period = 1152 * (256 - TB) / 8MHz → in Z80 cycles: 576 * (256 - TB) */
+ * Timer A: 10-bit, period = 144 * (1024 - TA) master clocks at 8 MHz (18 us/count)
+ * Timer B:  8-bit, period = 144 * 16 * (256 - TB) master clocks (288 us/count)
+ * (ymfm: period * OPERATORS(24) * prescale(6); OPN datasheet: 72*(1024-NA)/phiM
+ * at the 4 MHz-equivalent clock).  In Z80 cycles (4 MHz) that is 72 and 1152. */
 static uint16_t timer_a_val;      /* 10-bit value from regs $24/$25 */
 static uint8_t  timer_b_val;      /* 8-bit value from reg $26 */
 static uint8_t  timer_ctrl;       /* reg $27: enable/load/reset */
@@ -56,8 +58,8 @@ static uint8_t  ym_adpcm_status;  /* status register 1 (bit7=ADPCM-B EOS, bits0-
 static uint8_t  ym_flag_mask = 0xBF;  /* reg $1C: masks EOS flags from status reads */
 static uint8_t  timer_irq_ena;    /* bits: 0=Timer A IRQ, 1=Timer B IRQ */
 
-#define TIMER_A_PERIOD(v)  (36 * (1024 - (v)))
-#define TIMER_B_PERIOD(v)  (576 * (256 - (v)))
+#define TIMER_A_PERIOD(v)  (72 * (1024 - (v)))
+#define TIMER_B_PERIOD(v)  (1152 * (256 - (v)))
 
 /* YM2610 IRQ output is level-sensitive: asserted while any enabled flag is set. */
 static void ym_update_irq(void)

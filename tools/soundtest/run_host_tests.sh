@@ -46,13 +46,19 @@ echo "building host tools..."
 g++ -O2 -std=c++17 -w -I"$YMFM" "$HERE/ymfm_play.cpp" "$YMFM"/ymfm_opn.cpp "$YMFM"/ymfm_adpcm.cpp "$YMFM"/ymfm_ssg.cpp "$YMFM"/ymfm_misc.cpp -o "$W/ymfm_play"
 for t in trace trace_st ssgstim; do gcc "${CF[@]}" "$HERE/$t.c" "$CZ80" -o "$W/$t" -lm; done
 for t in fmstim fmmodel; do gcc "${CF[@]}" "$HERE/$t.c" "$CZ80" -o "$W/$t" -lm; done
-gcc "${CF[@]}" "-DSRC=YM_SRC" "$HERE/equiv.c" "$CZ80" -o "$W/equiv"
-gcc "${CF[@]}" "-DSRC=YM_SRC" -DZ80_NO_IDLE_SKIP "$HERE/equiv.c" "$CZ80" -o "$W/equiv_noidle"
+gcc "${CF[@]}" "$HERE/equiv.c" "$CZ80" -o "$W/equiv"
+gcc "${CF[@]}" "$HERE/timers.c" "$CZ80" -o "$W/timers"
+g++ -O2 -std=c++17 -w -I"$YMFM" "$HERE/ymfm_timers.cpp" "$YMFM"/ymfm_opn.cpp "$YMFM"/ymfm_adpcm.cpp "$YMFM"/ymfm_ssg.cpp "$YMFM"/ymfm_misc.cpp -o "$W/ymfm_timers"
+gcc "${CF[@]}" -DZ80_NO_IDLE_SKIP "$HERE/equiv.c" "$CZ80" -o "$W/equiv_noidle"
 
 cd "$W"; M=m1.bin; V=vrom.bin; FAIL=0
 echo; echo "== Z80 idle-loop skipping must not change the output"
 ./equiv $M $V out_idle.pcm && ./equiv_noidle $M $V out_noidle.pcm
 if cmp -s out_idle.pcm out_noidle.pcm; then echo "PASS  idle skip: bit-identical over $(( $(stat -c %s out_idle.pcm) / 4 )) samples"; else echo "FAIL  idle skip changes the output"; FAIL=$((FAIL+1)); fi
+
+echo; echo "== Timer A/B periods vs ymfm (they set the music tempo)"
+if diff <(./timers) <(./ymfm_timers) >/dev/null; then echo "PASS  timer periods identical to ymfm for TA 0/1/512/900/1023, TB 0/128/192/255"
+else echo "FAIL  timer periods differ from ymfm:"; diff <(./timers) <(./ymfm_timers) | head; FAIL=$((FAIL+1)); fi
 
 echo; echo "== ADPCM-A/B with the real driver vs ymfm"
 ./trace $M $V 0 regs.txt ours_ab.pcm 2>/dev/null
