@@ -113,6 +113,7 @@ static uint32_t stat_port_writes;    /* any Z80 OUT instruction */
 static uint32_t stat_port_reads;     /* any Z80 IN instruction */
 static uint32_t stat_ram_writes;     /* Z80 writes to RAM */
 static uint32_t stat_nmis_fired;     /* NMIs actually raised to CZ80 */
+static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
 static uint32_t stat_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
@@ -147,6 +148,13 @@ void sound_debug_stats(void)
 		(long)stat_peak, (unsigned long)stat_nonzero,
 		fm_state.ch[0].enabled, fm_state.ch[1].enabled,
 		fm_state.ch[2].enabled, fm_state.ch[3].enabled);
+	if (cmd_log_printed < stat_cmd_count) {
+		debugf("[SND] cmds:");
+		for (; cmd_log_printed < stat_cmd_count && cmd_log_printed < sizeof(cmd_log); cmd_log_printed++)
+			debugf(" %02x", cmd_log[cmd_log_printed]);
+		debugf("\n");
+		cmd_log_printed = stat_cmd_count;
+	}
 	stat_peak = 0; stat_nonzero = 0;
 
 	/* Find top 6 ports by write count */
@@ -320,21 +328,6 @@ static const int32_t dt_tab[4 * 32] = {
 /* DT3 */ 2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,17,19,20,22,22,22,22
 };
 
-/* Frequency number to phase increment table.
- * fn_table[fnum] = (fnum * 2^20 / (144 * 2)) for the base octave. */
-static uint32_t fn_table[2048];
-static int fn_table_built = 0;
-
-static void build_fn_table(void)
-{
-	if (fn_table_built) return;
-	for (int i = 0; i < 2048; i++) {
-		/* YM2610 formula: phase_inc = fnum * 2^(block-1) / (144/2) */
-		fn_table[i] = (uint32_t)((double)i * 64.0 / 144.0 * 65536.0);
-	}
-	fn_table_built = 1;
-}
-
 /* Algorithm routing decomposition table.
  * For each of 8 algorithms, gives: c1_mod, m2_mod, c2_mod, out_flags, mem_src */
 static const uint8_t algo_table[8][5] = {
@@ -385,22 +378,34 @@ static void update_fm_channel(int ch_idx)
 	ym_chan_t *ch = &ym_ch[ch_idx];
 	struct rsp_fm_chan *rch = &fm_state.ch[ch_idx];
 
-	build_fn_table();
+	/* Frequency -> phase increment per OUTPUT sample.
+	 *
+	 * Native OPN: f = fnum * 2^block * fs / 2^21 with fs = 8 MHz / 144.
+	 * The RSP keeps a 32-bit phase whose bits 16..25 index a 1024-step sine,
+	 * so one cycle is 2^26 units, and it advances once per 22050 Hz output
+	 * sample:  inc = f * 2^26 / 22050 = (fnum << block) * PHASE_K  with
+	 * PHASE_K = (8e6/144) * 32 / 22050 = 80.625 (Q16 below). */
+	#define PHASE_K_Q16   5283830u    /* 80.6248 * 65536 */
+	#define DETUNE_SCALE  161         /* a detune unit is 1/2^20 of a native step = 2*PHASE_K here */
+	uint32_t base_inc = (uint32_t)(((uint64_t)((uint32_t)(ch->fnum & 0x7FF) << ch->block) * PHASE_K_Q16) >> 16);
 
-	/* Frequency → phase increment for each operator */
-	uint32_t base_inc = fn_table[ch->fnum & 0x7FF] >> (7 - ch->block);
+	/* Key code for detune: block + two note bits derived from fnum's top bits */
+	int f11 = (ch->fnum >> 10) & 1, f10 = (ch->fnum >> 9) & 1;
+	int f9  = (ch->fnum >> 8) & 1,  f8  = (ch->fnum >> 7) & 1;
+	int n3  = (f11 & (f10 | f9 | f8)) | ((f11 ^ 1) & f10 & f9 & f8);
+	int kc  = ((ch->block & 7) << 2) | (f11 << 1) | n3;
 
 	for (int op = 0; op < 4; op++) {
 		ym_slot_t *sl = &ch->slot[op];
 
 		/* Apply detune */
-		int dt_idx = (sl->dt & 3) * 32 + (ch->fnum >> 7);
-		int32_t dt_val = dt_tab[dt_idx];
+		int dt_idx = (sl->dt & 3) * 32 + kc;
+		int32_t dt_val = dt_tab[dt_idx] * DETUNE_SCALE;
 		if (sl->dt & 4) dt_val = -dt_val;
 
-		/* Apply multiply */
+		/* Apply multiply (MUL=0 means x0.5) */
 		uint32_t inc = base_inc;
-		if (sl->mul) inc = (inc * sl->mul) >> 0;
+		if (sl->mul) inc = inc * sl->mul;
 		else         inc = inc >> 1;
 		inc += dt_val;
 
@@ -616,6 +621,8 @@ static INT32 z80_irq_callback(INT32 irqline)
 
 /* ---- Public API ---- */
 
+static void snd_cmd(uint8_t cmd);
+
 void sound_init(const uint8_t *rom, int rom_size)
 {
 	memset(&z80_cpu, 0, sizeof(z80_cpu));
@@ -697,6 +704,18 @@ void sound_update(int cycles)
 	if (!z80_has_rom) return;  /* no sound driver loaded — skip */
 
 	stat_update_calls++;
+#ifdef SND_SELFTEST
+	{
+		/* Real Blazing Star startup sequence (as sent by BIOS/game), then the
+		 * music command $5F. Frame numbers are sound_update() calls. */
+		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
+			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
+			{136,0x07},{140,0x7f},{160,0x5f},
+		};
+		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
+			if (stat_update_calls == tl[i].fr) snd_cmd(tl[i].cmd);
+	}
+#endif
 
 	/* Run Z80 in chunks so timers fire mid-frame.
 	 * 4000 cycles ≈ 1 ms — enough granularity for Timer A/B. */
@@ -714,11 +733,21 @@ void sound_update(int cycles)
 	}
 }
 
-void sound_command(uint8_t cmd)
+static void snd_cmd(uint8_t cmd)
 {
+	if (stat_cmd_count < sizeof(cmd_log)) cmd_log[stat_cmd_count] = cmd;
 	stat_cmd_count++;
 	cmd_latch = cmd;
 	nmi_pending = 1;
+}
+
+void sound_command(uint8_t cmd)
+{
+#ifndef SND_SELFTEST
+	snd_cmd(cmd);
+#else
+	(void)cmd;   /* self-test build: the 68K is ignored, commands are injected */
+#endif
 }
 
 uint8_t sound_result(void)
@@ -829,6 +858,31 @@ int sound_render(int16_t *buf, int max_samples)
 		buf[i * 2 + 0] = (int16_t)s; /* L */
 		buf[i * 2 + 1] = (int16_t)s; /* R */
 	}
+
+#if defined(SND_SELFTEST) && defined(N64)
+	/* Stream 150 frames of mono output (from frame 170) to the debug log as
+	 * hex, so the waveform can be rebuilt and analysed off-target.  Streamed,
+	 * not buffered: the PB-ROM allocation leaves very little heap to spare. */
+	{
+		enum { CAP_FRAMES = 150, CAP_START = 170 };
+		static int cap_frames = 0;
+		if (stat_update_calls >= CAP_START && cap_frames < CAP_FRAMES) {
+			static const char hx[] = "0123456789abcdef";
+			if (cap_frames == 0) debugf("[WAV] begin rate=22050\n");
+			for (int i = 0; i < nsamples; i += 46) {
+				char line[46 * 4 + 1]; int k = 0;
+				for (int j = 0; j < 46 && i + j < nsamples; j++) {
+					uint16_t v = (uint16_t)buf[(i + j) * 2];
+					line[k++] = hx[(v >> 12) & 15]; line[k++] = hx[(v >> 8) & 15];
+					line[k++] = hx[(v >> 4) & 15];  line[k++] = hx[v & 15];
+				}
+				line[k] = 0;
+				debugf("[WAV] %s\n", line);
+			}
+			if (++cap_frames == CAP_FRAMES) debugf("[WAV] end\n");
+		}
+	}
+#endif
 
 	return nsamples;
 #endif
