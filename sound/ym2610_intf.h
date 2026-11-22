@@ -46,6 +46,11 @@ void sound_reset(void);
  * Called from emu.c's frame loop. */
 void sound_update(int cycles);
 
+/* Catch the Z80 up to the 68K's position within the current frame
+ * (master_clock_in_frame in 24 MHz units).  Call before touching the
+ * command/reply latches from the 68K side. */
+void sound_sync(int64_t master_clock_in_frame);
+
 /* Send a command from the 68K to the Z80 (triggers NMI).
  * Called from hw.c when 68K writes to 0x320000. */
 void sound_command(uint8_t cmd);

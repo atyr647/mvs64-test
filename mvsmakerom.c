@@ -42,6 +42,7 @@ typedef struct {
 	uint8_t *CROM; int crom_size;
 	uint8_t *SROM; int srom_size;
 	uint8_t *MROM; int mrom_size;  /* Z80 sound driver ROM */
+	uint8_t *VROM; int vrom_size;  /* ADPCM sample ROMs (v1, v2, ... concatenated) */
 } Game;
 
 typedef struct {
@@ -345,13 +346,14 @@ void load_game(const char *fn, Game *game) {
 
 	if (!mz_zip_reader_init_file(&zip, fn, 0)) panic("%s\n", mz_zip_get_error_string(mz_zip_get_last_error(&zip)));
 
-	Romset P, C, S, X, M;
+	Romset P, C, S, X, M, V;
 
 	memset(&P, 0, sizeof(Romset));
 	memset(&C, 0, sizeof(Romset));
 	memset(&S, 0, sizeof(Romset));
 	memset(&X, 0, sizeof(Romset));
 	memset(&M, 0, sizeof(Romset));
+	memset(&V, 0, sizeof(Romset));
 
 	for (int index = 0;;index++) {
 		mz_zip_archive_file_stat stat;
@@ -368,6 +370,7 @@ void load_game(const char *fn, Game *game) {
 		if ((idx = romtype(fn, 's'))) romset_add(&S, idx, &stat);
 		if ((idx = romtype(fn, 'c'))) romset_add(&C, idx, &stat);
 		if ((idx = romtype(fn, 'm'))) romset_add(&M, idx, &stat);
+		if ((idx = romtype(fn, 'v'))) romset_add(&V, idx, &stat);
 		if (strstr(fn, "sma")) romset_add(&X, 1, &stat);
 	}
 
@@ -449,6 +452,12 @@ void load_game(const char *fn, Game *game) {
 		game->mrom_size = M.total_size;
 	}
 
+	// Load ADPCM sample ROMs (V1, V2, ...) as one linear blob, in index order
+	if (romset_count(&V) > 0) {
+		game->VROM = romset_load(&V, &zip, 0);
+		game->vrom_size = V.total_size;
+	}
+
 	// Preprocess graphics ROMs to convert it into N64 4bpp format
 	crom_preprocess(game->CROM, game->crom_size);
 	fixrom_preprocess(game->SROM, game->srom_size);
@@ -507,6 +516,11 @@ int main(int argc, char *argv[]) {
 	if (game.MROM && game.mrom_size > 0) {
 		outfn[off] = 'm';
 		saveto(game.MROM, game.mrom_size, outfn);
+	}
+
+	if (game.VROM && game.vrom_size > 0) {
+		outfn[off] = 'v';
+		saveto(game.VROM, game.vrom_size, outfn);
 	}
 
 	strcpy(outfn+off, "?.bios");

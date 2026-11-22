@@ -138,7 +138,7 @@ uint32_t read_hwio(uint32_t addr, int sz)  {
 		case 0x01: assert(sz==1); return 0xFF ^ DIPSW_FREEPLAY; // dipswitches
 
 	} else if ((addr>>16) == 0x32) switch (addr&0xFFFF) {
-		case 0x00: assert(sz==1); z80_result = sound_result(); return z80_result;
+		case 0x00: assert(sz==1); sound_sync(emu_clock_frame()); z80_result = sound_result(); return z80_result;
 		case 0x01: assert(sz==1); return input_status_a_r();
 
 	} else if ((addr>>16) == 0x38) switch (addr&0xFFFF) {
@@ -179,6 +179,7 @@ void write_hwio(uint32_t addr, uint32_t val, int sz)  {
 
 	} else if ((addr>>16) == 0x32) switch (addr&0xFFFF) {
 		case 0x00: assert(sz==1);
+			sound_sync(emu_clock_frame());   /* let the Z80 finish earlier commands first */
 			sound_command(val);
 			return;
 

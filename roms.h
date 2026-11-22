@@ -8,6 +8,12 @@ extern unsigned int rom_pc_idle_skip;
 extern uint8_t *M1_ROM;
 extern int M1_ROM_SIZE;
 
+/* ADPCM sample ROM (V1+V2+... concatenated, as packed by mvsmakerom).
+ * vrom_read() copies len bytes at offset; anything outside the ROM reads as 0.
+ * dst must be 16-byte aligned and len a multiple of 16 on N64 (DMA + cache). */
+extern int VROM_SIZE;
+void vrom_read(uint32_t offset, uint8_t *dst, int len);
+
 void rom_load(const char *dir);
 void rom_load_prom(const char *dir);
 

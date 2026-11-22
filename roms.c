@@ -27,6 +27,14 @@ unsigned int rom_pc_idle_skip = 0;
 // Z80 sound driver ROM (M1)
 uint8_t *M1_ROM = NULL;
 int M1_ROM_SIZE = 0;
+
+// ADPCM sample ROM (V1+V2+...), streamed from the cart on demand
+int VROM_SIZE = 0;
+#ifdef N64
+static int vrom_file = -1;
+#else
+static FILE *vrom_file = NULL;
+#endif
 extern uint32_t profile_dma_load;
 
 static SpriteCache srom_cache;
@@ -405,6 +413,21 @@ void rom_load_prom(const char *dir) {
 	rom(dir, "p.rom", 0, 0, P_ROM, P_ROM_SIZE, false);
 }
 
+void vrom_read(uint32_t offset, uint8_t *dst, int len) {
+	if (offset >= (uint32_t)VROM_SIZE || len <= 0) { memset(dst, 0, len > 0 ? len : 0); return; }
+	int avail = VROM_SIZE - (int)offset;
+	int n = len < avail ? len : avail;
+	#ifdef N64
+	dfs_seek(vrom_file, offset, SEEK_SET);
+	dfs_read(dst, 1, n, vrom_file);
+	data_cache_hit_invalidate(dst, (n + 15) & ~15);
+	#else
+	fseek(vrom_file, offset, SEEK_SET);
+	if (fread(dst, 1, n, vrom_file) != (size_t)n) n = 0;
+	#endif
+	if (n < len) memset(dst + n, 0, len - n);
+}
+
 void rom_load(const char *dir) {
 	rom_load_prom(dir);
 	rom(dir, "p.bios", 0, 0, BIOS, sizeof(BIOS), false);
@@ -445,6 +468,19 @@ void rom_load(const char *dir) {
 	#ifdef N64
 	dir = "";
 	#endif
+
+	/* ADPCM sample ROM: keep a handle open and read it in small chunks */
+	{
+		const char *vfn = strcatalloc(dir, "v.rom");
+		#ifdef N64
+		vrom_file = dfs_open(vfn);
+		if (vrom_file >= 0) VROM_SIZE = dfs_size(vrom_file);
+		#else
+		vrom_file = fopen(vfn, "rb");
+		if (vrom_file) { fseek(vrom_file, 0, SEEK_END); VROM_SIZE = ftell(vrom_file); }
+		#endif
+		debugf("[ROM] V ROM (ADPCM samples): %d bytes\n", VROM_SIZE);
+	}
 
 	srom_fn[0] = strcatalloc(dir, "s.bios");
 	srom_fn[1] = strcatalloc(dir, "s.rom");

@@ -116,7 +116,8 @@ static uint32_t stat_nmis_fired;     /* NMIs actually raised to CZ80 */
 static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
 static uint32_t stat_nonzero;
-static uint32_t stat_ssg_nonzero;        /* non-zero output samples since last dump */
+static uint32_t stat_ssg_nonzero;
+static uint32_t stat_adpcma_keyons, stat_adpcma_ends, stat_adpcma_nonzero;        /* non-zero output samples since last dump */
 static uint32_t stat_port_hist[256]; /* per-port OUT histogram */
 static uint32_t stat_port_rhist[256]; /* per-port IN histogram */
 static uint8_t stat_p04_vals[16];   /* first unique values written to $04 */
@@ -145,8 +146,9 @@ void sound_debug_stats(void)
 		(unsigned long)stat_keyon_writes,
 		(unsigned long)z80_pc,
 		(unsigned long)z80_sp);
-	debugf("[SND] audio: peak=%ld nonzero=%lu ssg=%lu fm_ch_en=%d%d%d%d\n",
+	debugf("[SND] audio: peak=%ld nonzero=%lu ssg=%lu adpcmA(keyon=%lu end=%lu nz=%lu) fm_ch_en=%d%d%d%d\n",
 		(long)stat_peak, (unsigned long)stat_nonzero, (unsigned long)stat_ssg_nonzero,
+		(unsigned long)stat_adpcma_keyons, (unsigned long)stat_adpcma_ends, (unsigned long)stat_adpcma_nonzero,
 		fm_state.ch[0].enabled, fm_state.ch[1].enabled,
 		fm_state.ch[2].enabled, fm_state.ch[3].enabled);
 	if (cmd_log_printed < stat_cmd_count) {
@@ -157,6 +159,7 @@ void sound_debug_stats(void)
 		cmd_log_printed = stat_cmd_count;
 	}
 	stat_peak = 0; stat_nonzero = 0; stat_ssg_nonzero = 0;
+	stat_adpcma_nonzero = 0;
 
 	/* Find top 6 ports by write count */
 	int top[6] = {-1,-1,-1,-1,-1,-1};
@@ -740,6 +743,154 @@ static int32_t ssg_sample(void)
 	return mix - ((ssg_dc + 128) >> 8);
 }
 
+#ifndef ADPCMA_GAIN_SHIFT
+#define ADPCMA_GAIN_SHIFT 1
+#endif
+
+/* ---- ADPCM-A: 6 channels of 4-bit ADPCM from the V ROM ----
+ *
+ * 12-bit accumulator, 49-entry step table, 18518.5 Hz native rate
+ * (8 MHz / 432), resampled (linear) to the 22050 Hz output.  Samples are
+ * streamed from the cart in 256-byte chunks per channel. */
+
+extern void vrom_read(uint32_t offset, uint8_t *dst, int len);
+
+#define ADPCMA_CHUNK       256
+#define ADPCMA_RATE_Q16    55042u        /* 18518.5 / 22050 * 65536 */
+
+static const int16_t adpcma_steps[49] = {
+	16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552
+};
+static const int8_t adpcma_step_inc[8] = { -1, -1, -1, -1, 2, 5, 7, 9 };
+
+typedef struct {
+	uint8_t  on;
+	uint8_t  hi;          /* next nibble is the high one */
+	uint8_t  level;       /* 0..31 */
+	uint8_t  pan;         /* bits 7,6 = L,R */
+	uint16_t start_reg, end_reg;   /* address registers in 256-byte units */
+	uint32_t pos;         /* byte address of the nibble pair being decoded */
+	uint32_t end;         /* first byte address AFTER the sample (end register + 1) << 8 */
+	uint8_t  byte;        /* byte currently being decoded */
+	uint32_t chunk_base;  /* ROM offset of the chunk in adpcma_buf, or ~0 */
+	int32_t  acc, step;   /* acc: 12-bit unsigned, wraps (&0xFFF); sign-extended on output */
+	int32_t  s0, s1;      /* last two decoded samples, for interpolation */
+	uint32_t frac;
+} adpcma_t;
+
+static adpcma_t adpcma[6];
+static uint8_t  adpcma_total = 0x3F;      /* total level register, 0..63 */
+static uint8_t  adpcma_buf[6][ADPCMA_CHUNK] __attribute__((aligned(16)));
+
+static inline int adpcma_fetch(int ch, uint32_t addr)
+{
+	adpcma_t *a = &adpcma[ch];
+	uint32_t base = addr & ~(uint32_t)(ADPCMA_CHUNK - 1);
+	if (a->chunk_base != base) {
+		vrom_read(base, adpcma_buf[ch], ADPCMA_CHUNK);
+		a->chunk_base = base;
+	}
+	return adpcma_buf[ch][addr & (ADPCMA_CHUNK - 1)];
+}
+
+/* Decode the next native-rate sample of channel ch; returns 0 when finished.
+ * Matches ymfm: the end address is inclusive and only its low 20 bits are
+ * compared, checked just before fetching each new byte. */
+static int adpcma_decode(int ch)
+{
+	adpcma_t *a = &adpcma[ch];
+	int nib;
+	if (a->hi) {
+		if (((a->pos ^ a->end) & 0xFFFFF) == 0) return 0;
+		a->byte = (uint8_t)adpcma_fetch(ch, a->pos++);
+		nib = a->byte >> 4;
+		a->hi = 0;
+	} else {
+		nib = a->byte & 15;
+		a->hi = 1;
+	}
+
+	int d = ((2 * (nib & 7) + 1) * adpcma_steps[a->step]) / 8;
+	if (nib & 8) d = -d;
+	a->acc = (a->acc + d) & 0xFFF;                    /* 12-bit wrap */
+	a->step += adpcma_step_inc[nib & 7];
+	if (a->step < 0) a->step = 0; else if (a->step > 48) a->step = 48;
+	return 1;
+}
+
+static void adpcma_keyon(int ch)
+{
+	adpcma_t *a = &adpcma[ch];
+	a->pos  = (uint32_t)a->start_reg << 8;
+	a->end  = ((uint32_t)a->end_reg + 1) << 8;
+	a->hi = 1; a->acc = 0; a->step = 0;
+	a->s0 = a->s1 = 0; a->frac = 0;
+	a->chunk_base = ~(uint32_t)0;
+	a->on = 1;
+	stat_adpcma_keyons++;
+#ifdef N64
+	if (stat_adpcma_keyons <= 40)
+		debugf("[ADPCMA] keyon ch%d start=%04x end=%04x (%lu bytes) lvl=%02x pan=%02x tl=%02x\n",
+			ch, a->start_reg, a->end_reg, (unsigned long)(a->end - a->pos), a->level, a->pan, adpcma_total);
+#endif
+}
+
+static void adpcma_write(uint8_t addr, uint8_t val)
+{
+	if (addr == 0x00) {                               /* key on / dump */
+		for (int c = 0; c < 6; c++)
+			if (val & (1 << c)) {
+				if (val & 0x80) adpcma[c].on = 0;
+				else            adpcma_keyon(c);
+			}
+	} else if (addr == 0x01) {
+		adpcma_total = val & 0x3F;
+	} else if (addr >= 0x08 && addr <= 0x0D) {
+		adpcma[addr - 0x08].level = val & 0x1F;
+		adpcma[addr - 0x08].pan   = val & 0xC0;
+	} else if (addr >= 0x10 && addr <= 0x2D) {
+		int c = addr & 7;
+		if (c >= 6) return;
+		switch (addr >> 3) {                          /* 2:$10 3:$18 4:$20 5:$28 */
+		case 2: adpcma[c].start_reg = (adpcma[c].start_reg & 0xFF00) | val; break;
+		case 3: adpcma[c].start_reg = (adpcma[c].start_reg & 0x00FF) | ((uint16_t)val << 8); break;
+		case 4: adpcma[c].end_reg   = (adpcma[c].end_reg   & 0xFF00) | val; break;
+		case 5: adpcma[c].end_reg   = (adpcma[c].end_reg   & 0x00FF) | ((uint16_t)val << 8); break;
+		}
+	}
+}
+
+/* One 22050 Hz output sample of all ADPCM-A channels (signed) */
+static int32_t adpcma_sample(void)
+{
+	int32_t mix = 0;
+	for (int c = 0; c < 6; c++) {
+		adpcma_t *a = &adpcma[c];
+		if (!a->on) continue;
+		a->frac += ADPCMA_RATE_Q16;
+		while (a->frac >= 65536) {
+			a->frac -= 65536;
+			a->s0 = a->s1;
+			if (!adpcma_decode(c)) {                       /* reached the end address */
+				a->on = 0;
+				ym_adpcm_status |= (uint8_t)(1 << c);     /* end-of-sample flag */
+				stat_adpcma_ends++;
+				break;
+			}
+			a->s1 = (a->acc ^ 0x800) - 0x800;                 /* sign-extend 12 bits */
+		}
+		if (!a->on) continue;
+		/* volume = instrument level + total level attenuation; >= 63 is silent */
+		int vol = ((a->level ^ 0x1F) & 0x1F) + ((adpcma_total ^ 0x3F) & 0x3F);
+		if (vol >= 63 || !(a->pan & 0xC0)) continue;
+		int32_t v = a->s0 + (int32_t)(((int64_t)(a->s1 - a->s0) * (int32_t)a->frac) >> 16);
+		int32_t s = (((v << 4) * (15 - (vol & 7))) >> (5 + (vol >> 3))) & ~3;
+		mix += s;
+	}
+	if (mix) stat_adpcma_nonzero++;
+	return mix >> ADPCMA_GAIN_SHIFT;
+}
+
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
 {
 	stat_reg1_writes++;
@@ -839,22 +990,14 @@ static void ym2610_write_reg2(uint8_t addr, uint8_t val)
 	HOST_REG(2, addr, val);
 #endif
 
-	if (addr == 0x00) {
-		/* ADPCM-A dump/keyon: bit 7 = dump all, bits 0-5 = keyon mask.
-		 * Set end flags for any channels that are "started" (since we
-		 * don't actually play ADPCM, they instantly end). */
-		if (val & 0x80) {
-			ym_adpcm_status |= 0x3F; /* all ADPCM-A channels ended */
-		} else {
-			ym_adpcm_status |= (val & 0x3F); /* mark started channels as ended */
-		}
+	if (addr < 0x30) {
+		adpcma_write(addr, val);
 		return;
 	}
 
 	if (addr >= 0x30)
 		ym_write_fm_reg(1, addr, val); /* channels 2 & 3 */
 
-	/* TODO: $08-$0F ADPCM-A per-channel params, $10-$1F volumes */
 }
 
 /* Z80 IRQ acknowledge callback — clear the IRQ line */
@@ -878,6 +1021,8 @@ void sound_init(const uint8_t *rom, int rom_size)
 	for (int c = 0; c < 4; c++)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
 	eg_acc = 0; eg_cnt = 1;
+	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F;
+	for (int c = 0; c < 6; c++) { adpcma[c].level = 0x1F; adpcma[c].pan = 0xC0; }
 	memset(ssg_reg, 0, sizeof(ssg_reg)); memset(ssg_cnt, 0, sizeof(ssg_cnt)); memset(ssg_tone, 0, sizeof(ssg_tone));
 	ssg_noise_cnt = 0; ssg_lfsr = 1; ssg_noise_bit = 0; ssg_dc = 0; ssg_env_restart();
 
@@ -950,26 +1095,14 @@ void sound_reset(void)
 	memset(&fm_state, 0, sizeof(fm_state));
 }
 
-void sound_update(int cycles)
+/* Z80 cycles already executed in the current frame (see sound_sync) */
+static int z80_frame_done;
+
+/* Run the Z80 (+ YM2610 timers) for the given number of Z80 cycles, in chunks
+ * so timers fire mid-frame and NMIs are delivered promptly.
+ * 4000 cycles ~ 1 ms is enough granularity for Timer A/B. */
+static void z80_run(int cycles)
 {
-	if (!z80_has_rom) return;  /* no sound driver loaded — skip */
-
-	stat_update_calls++;
-#ifdef SND_SELFTEST
-	{
-		/* Real Blazing Star startup sequence (as sent by BIOS/game), then the
-		 * music command $5F. Frame numbers are sound_update() calls. */
-		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
-			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
-			{136,0x07},{140,0x7f},{160,0x5f},
-		};
-		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
-			if (stat_update_calls == tl[i].fr) snd_cmd(tl[i].cmd);
-	}
-#endif
-
-	/* Run Z80 in chunks so timers fire mid-frame.
-	 * 4000 cycles ≈ 1 ms — enough granularity for Timer A/B. */
 	while (cycles > 0) {
 		int chunk = (cycles < 4000) ? cycles : 4000;
 		/* The 68K command NMI is gated by the Z80's NMI-enable port. */
@@ -982,6 +1115,47 @@ void sound_update(int cycles)
 		Cz80_Exec(&z80_cpu, chunk);
 		cycles -= chunk;
 	}
+}
+
+/* Bring the Z80 up to the 68K's position in the frame.  Called by the 68K
+ * sound port accessors so that commands sent back-to-back within one frame
+ * are each seen by the Z80 (as on hardware) instead of overwriting the
+ * single command latch, and so replies are fresh when the 68K polls them.
+ * master_clock_in_frame is in 24 MHz units; the Z80 runs at master / 6. */
+void sound_sync(int64_t master_clock_in_frame)
+{
+	if (!z80_has_rom) return;
+	int target = (int)(master_clock_in_frame / 6);
+	if (target > Z80_CLOCK / 60) target = Z80_CLOCK / 60;
+	int delta = target - z80_frame_done;
+	if (delta > 0) {
+		z80_run(delta);
+		z80_frame_done += delta;
+	}
+}
+
+void sound_update(int cycles)
+{
+	if (!z80_has_rom) return;  /* no sound driver loaded — skip */
+
+	stat_update_calls++;
+#ifdef SND_SELFTEST
+	{
+		/* Real Blazing Star startup sequence (as sent by BIOS/game), then the
+		 * music command $5F. Frame numbers are sound_update() calls. */
+		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
+			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
+			{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},
+		};
+		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
+			if (stat_update_calls == tl[i].fr) snd_cmd(tl[i].cmd);
+	}
+#endif
+
+	/* Finish the frame: run whatever the 68K-side syncs did not already cover */
+	int remaining = cycles - z80_frame_done;
+	if (remaining > 0) z80_run(remaining);
+	z80_frame_done = 0;
 }
 
 static void snd_cmd(uint8_t cmd)
@@ -1120,7 +1294,7 @@ int sound_render(int16_t *buf, int max_samples)
 	for (int i = 0; i < nsamples; i++) {
 		int32_t ssg = ssg_sample();
 		if (ssg) stat_ssg_nonzero++;
-		int32_t s = fm_output[i] * FM_GAIN + ssg;
+		int32_t s = fm_output[i] * FM_GAIN + ssg + adpcma_sample();
 		if (s > 32767) s = 32767;
 		if (s < -32768) s = -32768;
 		if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
