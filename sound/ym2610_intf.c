@@ -92,7 +92,14 @@ static void timers_advance(int cycles)
 }
 
 /* RSP FM state (filled by CPU-side envelope updates) */
-static struct rsp_fm_state __attribute__((aligned(8))) fm_state;
+/* The RSP DMAs channel phases back into this block, so the CPU must never hold
+ * a stale cached copy: keep it on its own 16-byte-aligned cache lines (256 bytes)
+ * so it can be invalidated after each render without touching neighbours. */
+static struct {
+	struct rsp_fm_state st;
+	uint8_t pad[256 - sizeof(struct rsp_fm_state)];
+} __attribute__((aligned(16))) fm_wrap;
+#define fm_state (fm_wrap.st)
 static int32_t __attribute__((aligned(16))) fm_output[512]; /* max samples per frame (16-byte aligned for cache ops) */
 
 /* Diagnostic counters */
@@ -742,7 +749,7 @@ int sound_render(int16_t *buf, int max_samples)
 {
 	stat_frames++;
 	int nsamples = max_samples;
-	if (nsamples > 256) nsamples = 256;
+	if (nsamples > 512) nsamples = 512;
 
 #if SOUND_DEBUG_MODE == 1
 	/* 440Hz sine wave at 22050Hz: period = 50 samples */
@@ -796,14 +803,29 @@ int sound_render(int16_t *buf, int max_samples)
 	return nsamples;
 
 #else
-	fm_state.num_samples = nsamples;
-	memset(fm_output, 0, nsamples * sizeof(int32_t));
-
 #ifdef N64
-	rsp_fm_render(&fm_state, fm_output);
-	rspq_wait();
+	/* The RSP overlay holds at most 256 output samples per render, so split the
+	 * frame into equal chunks (each a multiple of 2 samples = 8-byte DMA aligned).
+	 * Channel phases carry over between chunks through fm_state. */
+	{
+		int chunks = (nsamples + 255) / 256;
+		int per = ((nsamples + chunks - 1) / chunks + 1) & ~1;
+		int off = 0;
+		while (off < nsamples) {
+			int n = nsamples - off;
+			if (n > per) n = per;
+			fm_state.num_samples = n;
+			rsp_fm_render(&fm_state, fm_output + off);
+			rspq_wait();
+			/* RSP wrote the phases back to RDRAM: drop our stale cached copy. */
+			data_cache_hit_invalidate(&fm_wrap, sizeof(fm_wrap));
+			off += n;
+		}
+	}
 	/* Invalidate cache so CPU sees RSP's DMA writes */
 	data_cache_hit_invalidate(fm_output, (nsamples * sizeof(int32_t) + 15) & ~15);
+#else
+	memset(fm_output, 0, nsamples * sizeof(int32_t));
 #endif
 
 	/* Convert 32-bit mono → 16-bit stereo */

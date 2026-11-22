@@ -15,7 +15,7 @@ exp_tab:    .space 512       /* 256 x uint16_t */
 
     .bss
     .align 3
-chan_state:  .space 228       /* YM2610: 4 channels * 56 bytes + 4 bytes header */
+chan_state:  .space 232       /* YM2610: 4 channels * 56 + 8 header; multiple of 8 so work_out stays DMA-aligned */
 work_out:   .space 1024      /* up to 256 x int32_t output samples */
 rdram_state: .space 4        /* saved RDRAM addr for state DMA back */
 rdram_out:   .space 4        /* saved RDRAM addr for output DMA */
@@ -45,7 +45,7 @@ cmd_fm_init_tables:
     # cmd_fm_render
     #
     # a0[23:0]  = num_samples
-    # a1        = PhysicalAddr(state)  [344 bytes]
+    # a1        = PhysicalAddr(state)  [232 bytes]
     # a2        = PhysicalAddr(out_buf)
     #
     # Register allocation:
@@ -69,10 +69,10 @@ cmd_fm_render:
     sw      a2, %lo(rdram_out)
     andi    k1, a0, 0xFFFF          /* k1 = num_samples */
 
-    /* DMA channel state from RDRAM to DMEM (YM2610: 228 bytes) */
+    /* DMA channel state from RDRAM to DMEM (YM2610: 232 bytes) */
     move    s0, a1
     li      s4, %lo(chan_state)
-    li      t0, DMA_SIZE(228, 1)
+    li      t0, DMA_SIZE(232, 1)
     jal     DMAIn
     nop
 
@@ -395,10 +395,10 @@ chan_next:
     bnez    fp, chan_loop
     nop
 
-    /* ---- DMA state back to RDRAM (YM2610: 228 bytes) ---- */
+    /* ---- DMA state back to RDRAM (YM2610: 232 bytes) ---- */
     lw      s0, %lo(rdram_state)
     li      s4, %lo(chan_state)
-    li      t0, DMA_SIZE(228, 1)
+    li      t0, DMA_SIZE(232, 1)
     jal     DMAOut
     nop
 

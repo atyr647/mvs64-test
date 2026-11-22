@@ -45,7 +45,8 @@ struct rsp_fm_state {
 	struct rsp_fm_chan ch[YM2610_FM_CHANNELS];  /* 224 bytes */
 	uint16_t num_samples;
 	uint16_t pad;
-}; /* 228 bytes */
+	uint32_t pad2;          /* RSP DMA moves multiples of 8 bytes: 228 -> 232 */
+}; /* 232 bytes */
 
 void rsp_fm_init(void);
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);
