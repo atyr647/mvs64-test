@@ -12,7 +12,7 @@ void vrom_read(uint32_t off,uint8_t*dst,int len){ fseek(vf,off,SEEK_SET); if(fre
 static int16_t buf[1024*2];
 int main(int argc,char**argv){
   FILE*f=fopen(argv[1],"rb"); static uint8_t rom[131072]; int n=fread(rom,1,sizeof rom,f); fclose(f);
-  vf=fopen(argv[2],"rb"); int mode=atoi(argv[3]); tf=fopen(argv[4],"w"); FILE*o=fopen(argv[5],"wb");
+  vf=fopen(argv[2],"rb"); int mode=atoi(argv[3]); tf=fopen(argv[4],"w"); FILE*o=fopen(argv[5],"wb"); FILE*oR=argc>6?fopen(argv[6],"wb"):NULL;
   sound_init(rom,n);
   /* command timeline (frame, cmd): real startup, then gameplay commands seen in the autoplay log */
   static const struct{int fr;int cmd;} tl[]={
@@ -31,8 +31,8 @@ int main(int argc,char**argv){
     else { adpcma_total=0; adpcmb_reg[1]&=~0xC0; }
     sound_render(buf,368);
     memcpy(&ssg_reg[8],sv_ssg,3); adpcma_total=sv_tl; adpcmb_reg[1]=sv_bpan;
-    for(int i=0;i<368;i++) fwrite(&buf[i*2],2,1,o);
+    for(int i=0;i<368;i++){ fwrite(&buf[i*2],2,1,o); if(oR) fwrite(&buf[i*2+1],2,1,oR); }
   }
-  fclose(o); fclose(tf);
+  fclose(o); if(oR) fclose(oR); fclose(tf);
   fprintf(stderr,"A keyons %u, B keyons %u, SSG nz %u\n",stat_adpcma_keyons,stat_adpcmb_keyons,stat_ssg_nonzero);
 }

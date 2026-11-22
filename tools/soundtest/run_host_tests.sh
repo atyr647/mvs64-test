@@ -45,7 +45,7 @@ CZ80="$REPO/cpu/cz80/cz80.c"
 echo "building host tools..."
 g++ -O2 -std=c++17 -w -I"$YMFM" "$HERE/ymfm_play.cpp" "$YMFM"/ymfm_opn.cpp "$YMFM"/ymfm_adpcm.cpp "$YMFM"/ymfm_ssg.cpp "$YMFM"/ymfm_misc.cpp -o "$W/ymfm_play"
 for t in trace trace_st ssgstim; do gcc "${CF[@]}" "$HERE/$t.c" "$CZ80" -o "$W/$t" -lm; done
-for t in fmstim fmmodel; do gcc "${CF[@]}" "$HERE/$t.c" "$CZ80" -o "$W/$t" -lm; done
+for t in fmstim fmmodel egstim; do gcc "${CF[@]}" "$HERE/$t.c" "$CZ80" -o "$W/$t" -lm; done
 gcc "${CF[@]}" "$HERE/equiv.c" "$CZ80" -o "$W/equiv"
 gcc "${CF[@]}" "$HERE/timers.c" "$CZ80" -o "$W/timers"
 g++ -O2 -std=c++17 -w -I"$YMFM" "$HERE/ymfm_timers.cpp" "$YMFM"/ymfm_opn.cpp "$YMFM"/ymfm_adpcm.cpp "$YMFM"/ymfm_ssg.cpp "$YMFM"/ymfm_misc.cpp -o "$W/ymfm_timers"
@@ -61,8 +61,8 @@ if diff <(./timers) <(./ymfm_timers) >/dev/null; then echo "PASS  timer periods 
 else echo "FAIL  timer periods differ from ymfm:"; diff <(./timers) <(./ymfm_timers) | head; FAIL=$((FAIL+1)); fi
 
 echo; echo "== ADPCM-A/B with the real driver vs ymfm"
-./trace $M $V 0 regs.txt ours_ab.pcm 2>/dev/null
-./ymfm_play $V regs.txt ref_ab.pcm /dev/null $((3000*368)) 0
+./trace $M $V 0 regs.txt ours_ab.pcm ours_ab_r.pcm 2>/dev/null
+./ymfm_play $V regs.txt ref_ab.pcm /dev/null $((3000*368)) 0 ref_ab_r.pcm
 PYTHONPATH="$HERE" $PY "$HERE/check_adpcm_ssg_game.py" "$W" || FAIL=$((FAIL+$?))
 
 echo; echo "== SSG register stimulus vs ymfm"
@@ -71,14 +71,19 @@ echo; echo "== SSG register stimulus vs ymfm"
 PYTHONPATH="$HERE" $PY "$HERE/check_ssg_stim.py" "$W" || FAIL=$((FAIL+$?))
 
 echo; echo "== FM note stimuli: C model of rsp_fm.S vs ymfm"
-./fmstim 55555.5555 fm_regs.txt model55_stim.pcm fm_labels.txt
-./ymfm_play $V fm_regs.txt ref_fm_l.pcm /dev/null $(( $(stat -c %s model55_stim.pcm) / 2 * 22050 / 55555 + 2000 )) 36
+./fmstim 55555.5555 fm_regs.txt model55_stim.pcm fm_labels.txt model55_stim_r.pcm
+./ymfm_play $V fm_regs.txt ref_fm_l.pcm /dev/null $(( $(stat -c %s model55_stim.pcm) / 2 * 22050 / 55555 + 2000 )) 36 ref_fm_r.pcm
 PYTHONPATH="$HERE" $PY "$HERE/check_fm_stim.py" "$W" || FAIL=$((FAIL+$?))
+
+echo; echo "== FM envelope generator (attack/decay/sustain/release/key scaling) vs ymfm"
+./egstim 55555.5555 eg_regs.txt model55_eg.pcm eg_labels.txt
+./ymfm_play $V eg_regs.txt ref_eg_l.pcm /dev/null $(( $(stat -c %s model55_eg.pcm) / 2 * 22050 / 55555 + 2000 )) 36
+PYTHONPATH="$HERE" $PY "$HERE/check_eg.py" "$W" || FAIL=$((FAIL+$?))
 
 echo; echo "== Blazing Star FM jingle (cmd \$5F): RSP model vs ymfm"
 ./trace_st $M $V 0 regs_st.txt /dev/null 2>/dev/null
-./ymfm_play $V regs_st.txt ref_st_l.pcm ref_st_ssg.pcm $((500*368)) 36
-./fmmodel $M $V 22050 model22.pcm && ./fmmodel $M $V 55555.5555 model55.pcm
+./ymfm_play $V regs_st.txt ref_st_l.pcm ref_st_ssg.pcm $((500*368)) 36 ref_st_r.pcm
+./fmmodel $M $V 22050 model22.pcm model22_r.pcm && ./fmmodel $M $V 55555.5555 model55.pcm
 PYTHONPATH="$HERE" $PY "$HERE/check_fm_jingle.py" "$W" || FAIL=$((FAIL+$?))
 
 echo; [ $FAIL -eq 0 ] && echo "ALL HOST SOUND CHECKS PASSED" || echo "$FAIL CHECK(S) FAILED"

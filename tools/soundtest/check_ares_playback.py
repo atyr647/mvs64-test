@@ -3,7 +3,7 @@ import sys, numpy as np
 from sndlib import Checks
 raw, skip = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 40
 C = Checks(); rate = 48000
-x = np.fromfile(raw, '<f4'); x = x[:len(x) // 2 * 2].reshape(-1, 2).mean(axis=1)
+st = np.fromfile(raw, '<f4'); st = st[:len(st) // 2 * 2].reshape(-1, 2); x = st.mean(axis=1)
 secs = len(x) // rate; gaps = []; audible = 0
 for i in range(skip, secs):
     seg = x[i * rate:(i + 1) * rate]
@@ -17,4 +17,8 @@ for i in range(skip, secs):
 print(f"      {secs} s captured, {audible} audible after {skip} s; peak {np.abs(x).max():.3f}")
 C.check("no dropout-sized gaps (20-100 ms) in audible audio", len(gaps) <= 2, f"{len(gaps)} seconds affected {gaps[:5]}")
 C.check("no clipping", np.abs(x).max() < 0.999, f"peak {np.abs(x).max():.3f}")
+L, R = st[skip * rate:, 0], st[skip * rate:, 1]
+diff = np.sqrt(((L - R) ** 2).mean()) / max(np.sqrt(((L + R) ** 2).mean() / 4), 1e-9)
+print(f"      stereo: L rms {np.sqrt((L**2).mean()):.4f}, R rms {np.sqrt((R**2).mean()):.4f}, side/mid ratio {diff:.3f} (0 = mono)")
+C.check("both output channels carry audio", np.sqrt((L**2).mean()) > 1e-3 and np.sqrt((R**2).mean()) > 1e-3, "L and R non-silent")
 sys.exit(C.fail)

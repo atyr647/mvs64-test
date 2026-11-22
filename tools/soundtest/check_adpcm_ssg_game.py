@@ -3,7 +3,8 @@ import sys, numpy as np
 from sndlib import *
 W = sys.argv[1]; C = Checks()
 for name, ours, ref, hp, ratio_lo, ratio_hi in [
-        ("ADPCM-A+B", "ours_ab.pcm", "ref_ab.pcm", False, 0.49, 0.51)]:
+        ("ADPCM-A+B left", "ours_ab.pcm", "ref_ab.pcm", False, 0.49, 0.51),
+        ("ADPCM-A+B right", "ours_ab_r.pcm", "ref_ab_r.pcm", False, 0.49, 0.51)]:
     o = load(f"{W}/{ours}"); r = resample(load(f"{W}/{ref}"), YM_RATE, OUT_RATE)
     n = min(len(o), len(r)); o, r = o[:n], r[:n]
     cs, ratios = [], []

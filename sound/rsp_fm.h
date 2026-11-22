@@ -37,7 +37,7 @@ struct rsp_fm_chan {
 	uint8_t  c2_mod;       /* 52: C2 modulation type */
 	uint8_t  out_flags;    /* 53: output contribution flags */
 	uint8_t  mem_src;      /* 54: delay memory source */
-	uint8_t  pad;          /* 55: alignment */
+	uint8_t  pan;          /* 55: output enable, bit7 = left, bit6 = right */
 }; /* 56 bytes */
 
 /* Full state for YM2610 FM channels */
@@ -49,6 +49,7 @@ struct rsp_fm_state {
 }; /* 232 bytes */
 
 void rsp_fm_init(void);
+/* Renders state->num_samples (<= 128) stereo samples, int32 L,R interleaved. */
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);
 
 #endif

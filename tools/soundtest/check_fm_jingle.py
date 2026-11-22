@@ -11,4 +11,10 @@ for rate, path in ((22050, "model22.pcm"), (55555.5555, "model55.pcm")):
     worst = max(abs(a - b) for a, b in zip(bo, br)); lsc = log_spec_corr(x, ref); ratio = rms(x) / rms(ref)
     C.check(f"FM jingle model@{int(rate)}", worst < 8 and lsc > 0.75 and 0.85 < ratio < 1.15,
             f"level {ratio:.2f}, log-spectrum corr {lsc:.3f}, band shares {['%.0f%%' % v for v in bo]} vs ymfm {['%.0f%%' % v for v in br]}")
+# right channel: Blazing Star pans FM channels 3-4 left-only during this jingle
+refR = 0.5 * resample(load(f"{W}/ref_st_r.pcm"), YM_RATE, OUT_RATE)[t0:t0 + N]
+xR = load(f"{W}/model22_r.pcm")[t0:t0 + N]
+ratio = rms(xR) / rms(refR); ratioL = rms(load(f"{W}/model22.pcm")[t0:t0 + N]) / rms(ref)
+C.check("FM jingle stereo (right channel)", 0.85 < ratio < 1.15 and log_spec_corr(xR, refR) > 0.7,
+        f"right level {ratio:.2f} vs left {ratioL:.2f}; ymfm R/L rms {rms(refR)/rms(ref):.2f}, ours {rms(xR)/rms(load(f'{W}/model22.pcm')[t0:t0+N]):.2f}")
 sys.exit(C.fail)

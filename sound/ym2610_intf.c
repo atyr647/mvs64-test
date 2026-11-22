@@ -42,6 +42,7 @@ static uint32_t z80_bank_off[4];  /* ROM offsets: [0]=$F000 2K [1]=$E000 4K [2]=
 /* YM2610 register state */
 static uint8_t ym_addr1;  /* address port 1 latch */
 static uint8_t ym_addr2;  /* address port 2 latch */
+static uint8_t fnum_latch; /* A4-A7 write, committed by A0-A3 */
 
 /* YM2610 Timer state.
  * Timer A: 10-bit, period = 144 * (1024 - TA) master clocks at 8 MHz (18 us/count)
@@ -103,7 +104,7 @@ static struct {
 	uint8_t pad[256 - sizeof(struct rsp_fm_state)];
 } __attribute__((aligned(16))) fm_wrap;
 #define fm_state (fm_wrap.st)
-static int32_t __attribute__((aligned(16))) fm_output[1024]; /* max samples per frame (16-byte aligned for cache ops) */
+static int32_t __attribute__((aligned(16))) fm_output[2048]; /* stereo int32 L,R pairs, up to 1024 samples (16-byte aligned for cache ops) */
 
 /* Diagnostic counters */
 static uint32_t stat_cmd_count;      /* 68K commands sent to Z80 */
@@ -400,6 +401,7 @@ typedef struct {
 	uint8_t   fb;        /* feedback (0-7) */
 	uint8_t   algo;      /* algorithm (0-7) */
 	uint8_t   active;    /* any key on? */
+	uint8_t   pan;       /* $B4-$B6 bits 7/6: left/right output enable */
 } ym_chan_t;
 
 static ym_chan_t ym_ch[4]; /* 4 FM channels for YM2610 */
@@ -543,8 +545,10 @@ static void update_fm_channel(int ch_idx)
 	 * sample:  inc = f * 2^26 / 22050 = (fnum << block) * PHASE_K  with
 	 * PHASE_K = (8e6/144) * 32 / 22050 = 80.625 (Q16 below). */
 	#define PHASE_K_Q16   5283830u    /* 80.6248 * 65536 */
-	#define DETUNE_SCALE  161         /* a detune unit is 1/2^20 of a native step = 2*PHASE_K here */
-	uint32_t base_inc = (uint32_t)(((uint64_t)((uint32_t)(ch->fnum & 0x7FF) << ch->block) * PHASE_K_Q16) >> 16);
+	/* Native step (ymfm/die order): ((fnum << block) >> 1) + detune, clamped
+	 * to 17 bits, then times MUL (x0.5 for MUL=0). One native unit is 1/2^20
+	 * of a cycle per 55.5 kHz sample = 2*PHASE_K of our units. */
+	uint32_t native = ((uint32_t)(ch->fnum & 0x7FF) << ch->block) >> 1;
 
 	/* Key code for detune: block + two note bits derived from fnum's top bits */
 	int f11 = (ch->fnum >> 10) & 1, f10 = (ch->fnum >> 9) & 1;
@@ -555,16 +559,14 @@ static void update_fm_channel(int ch_idx)
 	for (int op = 0; op < 4; op++) {
 		ym_slot_t *sl = &ch->slot[op];
 
-		/* Apply detune */
-		int dt_idx = (sl->dt & 3) * 32 + kc;
-		int32_t dt_val = dt_tab[dt_idx] * DETUNE_SCALE;
+		/* Detune is added before the multiplier, as on the chip */
+		int32_t dt_val = dt_tab[(sl->dt & 3) * 32 + kc];
 		if (sl->dt & 4) dt_val = -dt_val;
+		uint32_t step = (native + (uint32_t)dt_val) & 0x1FFFF;
 
-		/* Apply multiply (MUL=0 means x0.5) */
-		uint32_t inc = base_inc;
-		if (sl->mul) inc = inc * sl->mul;
-		else         inc = inc >> 1;
-		inc += dt_val;
+		/* MUL is an x.1 value: 0 -> 0.5, n -> n */
+		uint32_t mul2 = sl->mul ? (uint32_t)sl->mul * 2 : 1;
+		uint32_t inc = (uint32_t)(((uint64_t)step * mul2 * PHASE_K_Q16) >> 16);
 
 		rch->phase[op] = rch->phase[op]; /* preserve running phase */
 		rch->incr[op] = inc;
@@ -589,6 +591,7 @@ static void update_fm_channel(int ch_idx)
 
 	/* Feedback */
 	rch->fb_shift = ch->fb ? (ch->fb + 6) : 0;
+	rch->pan = ch->pan;
 
 	/* Channel active while any operator's envelope is still running */
 	{
@@ -602,6 +605,7 @@ static void update_fm_channel(int ch_idx)
  * ch_pair: 0 for channels 0/1 (port 1), 1 for channels 2/3 (port 2) */
 static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 {
+	if ((addr & 0xFC) == 0xA4) { fnum_latch = val & 0x3F; return; }  /* latched even for absent channels */
 	if ((addr & 3) == 0 || (addr & 3) == 3) return; /* only ch1/ch2 of each port exist */
 	int ch_offset = (addr & 3) - 1;
 	int ch_idx = ch_pair * 2 + ch_offset;
@@ -644,15 +648,15 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 		/* Frequency registers */
 		int freg = addr & 0x0F;
 		if (freg < 4) {
-			/* A0-A3: frequency number low 8 bits */
-			ch->fnum = (ch->fnum & 0x700) | val;
-			update_fm_channel(ch_idx);
-		} else if (freg >= 4 && freg < 8) {
-			/* A4-A7: block + frequency number high 3 bits */
-			ch->fnum = (ch->fnum & 0xFF) | ((val & 0x07) << 8);
-			ch->block = (val >> 3) & 7;
+			/* A0-A3: low 8 bits; commits the latched block/high bits too */
+			ch->fnum  = ((fnum_latch & 0x07) << 8) | val;
+			ch->block = (fnum_latch >> 3) & 7;
 			update_fm_channel(ch_idx);
 		}
+		/* A4-A7 (handled above): block + high 3 bits only go to a latch, one
+		 * per chip as in MAME's fn_h and Nuked-OPN2's reg_a4; the pitch
+		 * changes when the low byte is written. */
+		/* A8-AF: channel-3 special mode frequencies, unused (no CSM/3-slot) */
 
 	} else if (addr >= 0xB0 && addr < 0xB4) {
 		/* B0-B3: feedback / algorithm */
@@ -660,9 +664,13 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
 		ch->algo = val & 7;
 		update_fm_channel(ch_idx);
 	}
-	/* B4-B7: L/R output enable + LFO AMS/PMS (mono output, no LFO yet).
-	 * These used to fall into the FB/ALGO case above, so every pan write
-	 * reset the channel to algorithm 0 with no feedback. */
+	else if (addr >= 0xB4 && addr < 0xB8) {
+		/* B4-B6: L/R output enable (bits 7/6) + LFO AMS/PMS (no LFO: Blazing
+		 * Star never enables it).  These used to fall into the FB/ALGO case
+		 * above, so every pan write reset the channel to algorithm 0. */
+		ch->pan = val & 0xC0;
+		update_fm_channel(ch_idx);
+	}
 }
 
 
@@ -725,8 +733,18 @@ static inline int ssg_env_volume(void)
 	return (int)(ssg_env_state & 31) ^ (att ? 0 : 31);
 }
 
+#ifdef SND_SELFTEST
+static uint64_t st_cycles;     /* Z80 cycles run since boot */
+static uint64_t st_rendered;   /* output samples rendered since boot */
+#define ST_WHEN() (double)st_cycles / (Z80_CLOCK / 60), (double)st_rendered * 60 / SND_OUTPUT_RATE
+#endif
+
 static void ssg_write(uint8_t addr, uint8_t val)
 {
+#ifdef SND_SELFTEST
+	{ static int seen; if (!seen && (addr & 15) >= 8 && (addr & 15) <= 10 && (val & 0x1F)) {
+		seen = 1; debugf("[ST] first SSG volume write at z80 frame %.1f, audio frame %.1f\n", ST_WHEN()); } }
+#endif
 	static const uint8_t mask[16] = { 0xFF,0x0F,0xFF,0x0F,0xFF,0x0F,0x1F,0xFF,
 	                                  0x1F,0x1F,0x1F,0xFF,0xFF,0x0F,0xFF,0xFF };
 	ssg_reg[addr & 15] = val & mask[addr & 15];
@@ -901,43 +919,65 @@ static void adpcma_write(uint8_t addr, uint8_t val)
 	}
 }
 
-/* Add n output samples of all ADPCM-A channels into acc */
-static void adpcma_render(int32_t *out, int n)
+/* Add n output samples of all ADPCM-A channels into out (L) / outR (R).
+ * Each channel accumulates into one of three sums chosen by its pan bits
+ * (centre, left only, right only), so the inner loop does a single store. */
+static void adpcma_render(int32_t *out, int32_t *outR, int n)
 {
-	static int32_t acc[1024];
-	memset(acc, 0, n * sizeof(int32_t));
-	int any = 0;
+	static int32_t accs[3][1024];          /* 0: L+R, 1: L only, 2: R only */
+	int used = 0, any = 0;
 	for (int c = 0; c < 6; c++) {
 		adpcma_t *a = &adpcma[c];
 		if (!a->on) continue;
 		int vol = ((a->level ^ 0x1F) & 0x1F) + ((adpcma_total ^ 0x3F) & 0x3F);
 		int audible = vol < 63 && (a->pan & 0xC0);
 		int mul = 15 - (vol & 7), sh = 5 + (vol >> 3);
+		int k = (a->pan & 0xC0) == 0xC0 ? 0 : (a->pan & 0x80) ? 1 : 2;
+		int32_t *acc = accs[k];
+		if (audible && !(used & (1 << k))) { memset(acc, 0, n * sizeof(int32_t)); used |= 1 << k; }
+		/* locals: the int32 stores into acc would otherwise force reloads */
+		uint32_t frac = a->frac; int32_t s0 = a->s0, s1 = a->s1;
 		for (int i = 0; i < n; i++) {
-			a->frac += ADPCMA_RATE_Q16;
-			while (a->frac >= 65536) {
-				a->frac -= 65536;
-				a->s0 = a->s1;
+			frac += ADPCMA_RATE_Q16;
+			while (frac >= 65536) {
+				frac -= 65536;
+				s0 = s1;
 				if (!adpcma_decode(c)) {                    /* reached the end address */
 					a->on = 0;
 					ym_adpcm_status |= (uint8_t)(1 << c);  /* end-of-sample flag */
 					stat_adpcma_ends++;
 					break;
 				}
-				a->s1 = (a->acc ^ 0x800) - 0x800;           /* sign-extend 12 bits */
+				s1 = (a->acc ^ 0x800) - 0x800;           /* sign-extend 12 bits */
 			}
 			if (!a->on) break;
 			if (!audible) continue;
 			/* |s1-s0| < 4096 and frac < 65536: the product fits in 32 bits */
-			int32_t v = a->s0 + (((a->s1 - a->s0) * (int32_t)a->frac) >> 16);
+			int32_t v = s0 + (((s1 - s0) * (int32_t)frac) >> 16);
 			int32_t smp = (((v << 4) * mul) >> sh) & ~3;
 			acc[i] += smp;
 			any |= smp;
 		}
+		a->frac = frac; a->s0 = s0; a->s1 = s1;
 	}
-	if (any) {
-		stat_adpcma_nonzero += n;
-		for (int i = 0; i < n; i++) { int32_t v = acc[i] >> ADPCMA_GAIN_SHIFT; int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m; out[i] += v; }   /* gain on the channel sum */
+	if (!any) return;
+	stat_adpcma_nonzero += n;
+	/* gain on the channel sum (left = centre + left-only, right likewise) */
+	if (used == 1) {
+		int32_t *C = accs[0];
+		for (int i = 0; i < n; i++) {
+			int32_t v = C[i] >> ADPCMA_GAIN_SHIFT;
+			int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m;
+			out[i] += v; outR[i] += v;
+		}
+	} else {
+		for (int k = 0; k < 3; k++) if (!(used & (1 << k))) memset(accs[k], 0, n * sizeof(int32_t));
+		for (int i = 0; i < n; i++) {
+			int32_t v = (accs[0][i] + accs[1][i]) >> ADPCMA_GAIN_SHIFT;
+			int32_t w = (accs[0][i] + accs[2][i]) >> ADPCMA_GAIN_SHIFT;
+			int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m;
+			out[i] += v; outR[i] += w;
+		}
 	}
 }
 
@@ -1048,10 +1088,11 @@ static void adpcmb_write(uint8_t regnum, uint8_t val)
 }
 
 /* Add n output samples of ADPCM-B into acc */
-static void adpcmb_render(int32_t *acc, int n)
+static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
 {
 	if (adpcmb_status & ADPCMB_ST_PLAYING) {
 		int audible = (adpcmb_reg[1] & 0xC0) != 0;
+		int left = (adpcmb_reg[1] & 0x80) != 0, right = (adpcmb_reg[1] & 0x40) != 0;
 		int32_t lvl = adpcmb_reg[0xB];
 		uint32_t dn = adpcmb_delta_n();
 		for (int i = 0; i < n; i++) {
@@ -1072,7 +1113,8 @@ static void adpcmb_render(int32_t *acc, int n)
 			int32_t r = adpcmb_prev + (((adpcmb_acc - adpcmb_prev) * (int32_t)(adpcmb_pos16 >> 1)) >> 15);
 			r = ((r * lvl) >> 9) >> ADPCMA_GAIN_SHIFT;
 			{ int32_t m2 = r < 0 ? -r : r; if (m2 > pk_b) pk_b = m2; }
-			acc[i] += r;
+			if (left)  acc[i] += r;
+			if (right) accR[i] += r;
 		}
 		if (audible) stat_adpcmb_nonzero += n;
 	} else {
@@ -1085,7 +1127,7 @@ static void adpcmb_render(int32_t *acc, int n)
 		ym_adpcm_status = (ym_adpcm_status & ~0xC0) | live | (live << 1);
 }
 
-static void ssg_render(int32_t *acc, int n)
+static void ssg_render(int32_t *acc, int32_t *accR, int n)
 {
 	int silent = 1;
 	for (int c = 0; c < 3; c++) if (ssg_reg[8 + c] & 0x1F) silent = 0;
@@ -1120,7 +1162,7 @@ static void ssg_render(int32_t *acc, int n)
 		}
 		return;
 	}
-	for (int i = 0; i < n; i++) { int32_t v = ssg_sample(); if (v) stat_ssg_nonzero++; int32_t m = v < 0 ? -v : v; if (m > pk_ssg) pk_ssg = m; acc[i] += v; }
+	for (int i = 0; i < n; i++) { int32_t v = ssg_sample(); if (v) stat_ssg_nonzero++; int32_t m = v < 0 ? -v : v; if (m > pk_ssg) pk_ssg = m; acc[i] += v; accR[i] += v; }   /* SSG is mono */
 }
 
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
@@ -1253,6 +1295,7 @@ void sound_init(const uint8_t *rom, int rom_size)
 	memset(ym_ch, 0, sizeof(ym_ch));
 	for (int c = 0; c < 4; c++)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
+	for (int c = 0; c < 4; c++) { ym_ch[c].pan = 0xC0; fm_state.ch[c].pan = 0xC0; }
 	eg_acc = 0; eg_cnt = 1;
 	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F;
 	memset(adpcmb_reg, 0, sizeof(adpcmb_reg)); adpcmb_reset(); adpcmb_clk_acc = 0; ym_flag_mask = 0xBF;
@@ -1392,6 +1435,34 @@ static int z80_exec_idle_aware(int budget)
 #endif
 }
 
+#ifdef SND_SELFTEST
+/* Real Blazing Star startup sequence (as sent by BIOS/game), then the music
+ * command $5F etc.  `fr` is in 60 Hz frames of *sound* time: commands are
+ * injected at Z80 cycle (fr-1) * Z80_CLOCK/60, so the host harness and the
+ * N64 build (whose audio follows real time, not emulated frames) hear them at
+ * exactly the same moment whatever the emulation speed. */
+static const struct { uint32_t fr; uint8_t cmd; } st_tl[] = {
+	{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
+	{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},{620,0x80},
+};
+static unsigned st_next;       /* next timeline entry */
+#define ST_AT(i) ((uint64_t)(st_tl[i].fr - 1) * Z80_CLOCK / 60)
+
+/* Inject due commands; return how many cycles may run before the next one */
+static int selftest_due(int want)
+{
+	while (st_next < sizeof(st_tl)/sizeof(st_tl[0]) && st_cycles >= ST_AT(st_next)) {
+		snd_cmd(st_tl[st_next].cmd);
+		debugf("[ST] cmd %02x at z80 frame %.1f, audio frame %.1f\n", st_tl[st_next].cmd, ST_WHEN());
+		if (st_tl[st_next].cmd == 0x5f) selftest_cap_armed = 1;   /* capture from the next render */
+		st_next++;
+	}
+	if (st_next < sizeof(st_tl)/sizeof(st_tl[0]) && ST_AT(st_next) - st_cycles < (uint64_t)want)
+		want = (int)(ST_AT(st_next) - st_cycles);
+	return want;
+}
+#endif
+
 static void z80_run(int cycles)
 {
 #ifdef N64
@@ -1399,6 +1470,10 @@ static void z80_run(int cycles)
 #endif
 	while (cycles > 0) {
 		int chunk = (cycles < 4000) ? cycles : 4000;
+#ifdef SND_SELFTEST
+		chunk = selftest_due(chunk);
+		st_cycles += chunk;
+#endif
 		/* The 68K command NMI is gated by the Z80's NMI-enable port. */
 		if (nmi_pending && nmi_enabled) {
 			Cz80_Set_IRQ(&z80_cpu, IRQ_LINE_NMI, HOLD_LINE);
@@ -1436,22 +1511,8 @@ void sound_sync(int64_t master_clock_in_frame)
 static void snd_frame_tick(void)
 {
 	stat_update_calls++;
-#ifdef SND_SELFTEST
-	{
-		/* Real Blazing Star startup sequence (as sent by BIOS/game), then the
-		 * music command $5F etc. Frame numbers are emulated frames. */
-		static const struct { uint32_t fr; uint8_t cmd; } tl[] = {
-			{60,0x01},{64,0x03},{94,0x03},{98,0x03},{102,0x1b},{106,0x03},
-			{136,0x07},{140,0x7f},{160,0x5f},{400,0x03},{410,0x07},{440,0xc0},{500,0xdc},{560,0xcf},{620,0x80},
-		};
-		for (unsigned i = 0; i < sizeof(tl)/sizeof(tl[0]); i++)
-			if (stat_update_calls == tl[i].fr) {
-				snd_cmd(tl[i].cmd);
-				if (tl[i].cmd == 0x5f) selftest_cap_armed = 1;   /* capture from the next render */
-			}
-	}
-#endif
 }
+
 
 /* Fixed-rate path (host builds / test harnesses): one frame = `cycles`. */
 void sound_update(int cycles)
@@ -1578,6 +1639,7 @@ static void setup_test_fm_channel(void)
 	rch->out_flags = 0xF; /* all 4 operators → output (algo 7) */
 	rch->mem_src   = 0;
 	rch->enabled   = 1;
+	rch->pan       = 0xC0;
 }
 
 /* FM mix level.  The RSP sums carrier outputs at the chip's 13-bit operator
@@ -1635,7 +1697,7 @@ int sound_render(int16_t *buf, int max_samples)
 		/* Chunk = envelope update interval (also bounded by the RSP's 256-sample
 		 * work buffer).  Must be even so each chunk's output stays 8-byte aligned. */
 		#ifndef EG_CHUNK
-		#define EG_CHUNK 92
+		#define EG_CHUNK 92        /* <= 128: the RSP holds 128 stereo samples */
 		#endif
 		int per = EG_CHUNK;
 		int off = 0;
@@ -1647,7 +1709,7 @@ int sound_render(int16_t *buf, int max_samples)
 			eg_run(n);
 			eg_push();
 #endif
-			rsp_fm_render(&fm_state, fm_output + off);
+			rsp_fm_render(&fm_state, fm_output + 2 * off);
 			rspq_wait();
 			/* RSP wrote the phases back to RDRAM: drop our stale cached copy. */
 			data_cache_hit_invalidate(&fm_wrap, sizeof(fm_wrap));
@@ -1655,40 +1717,45 @@ int sound_render(int16_t *buf, int max_samples)
 		}
 	}
 	/* Invalidate cache so CPU sees RSP's DMA writes */
-	data_cache_hit_invalidate(fm_output, (nsamples * sizeof(int32_t) + 15) & ~15);
+	data_cache_hit_invalidate(fm_output, (nsamples * 2 * sizeof(int32_t) + 15) & ~15);
 	prof_rsp += TICKS_DISTANCE(t_rsp, TICKS_READ());
 	uint32_t t_mix = TICKS_READ();
 #else
-	memset(fm_output, 0, nsamples * sizeof(int32_t));
+	memset(fm_output, 0, nsamples * 2 * sizeof(int32_t));
 	eg_run(nsamples);      /* keep envelope state advancing on host builds */
 	eg_push();
 #endif
 
 	/* Mix: FM (from the RSP) + SSG + ADPCM-A + ADPCM-B, each rendered as a block */
 	{
-		static int32_t mix[1024];
-		for (int i = 0; i < nsamples; i++) { mix[i] = fm_output[i] >> FM_MIX_SHIFT; int32_t m = mix[i] < 0 ? -mix[i] : mix[i]; if (m > pk_fm) pk_fm = m; }
+		static int32_t mix[1024], mixR[1024];
+		for (int i = 0; i < nsamples; i++) {
+			mix[i]  = fm_output[2 * i]     >> FM_MIX_SHIFT;
+			mixR[i] = fm_output[2 * i + 1] >> FM_MIX_SHIFT;
+			int32_t m = mix[i] < 0 ? -mix[i] : mix[i]; if (m > pk_fm) pk_fm = m;
+			m = mixR[i] < 0 ? -mixR[i] : mixR[i]; if (m > pk_fm) pk_fm = m;
+		}
 #ifdef N64
 		uint32_t q0 = TICKS_READ();
-		ssg_render(mix, nsamples);
+		ssg_render(mix, mixR, nsamples);
 		uint32_t q1 = TICKS_READ();
-		adpcma_render(mix, nsamples);
+		adpcma_render(mix, mixR, nsamples);
 		uint32_t q2 = TICKS_READ();
-		adpcmb_render(mix, nsamples);
+		adpcmb_render(mix, mixR, nsamples);
 		uint32_t q3 = TICKS_READ();
 		prof_ssg += TICKS_DISTANCE(q0, q1); prof_a += TICKS_DISTANCE(q1, q2); prof_b += TICKS_DISTANCE(q2, q3);
 #else
-		ssg_render(mix, nsamples);
-		adpcma_render(mix, nsamples);
-		adpcmb_render(mix, nsamples);
+		ssg_render(mix, mixR, nsamples);
+		adpcma_render(mix, mixR, nsamples);
+		adpcmb_render(mix, mixR, nsamples);
 #endif
 		for (int i = 0; i < nsamples; i++) {
-			int32_t s = mix[i];
-			if (s > 32767) { s = 32767; stat_clipped++; }
-			if (s < -32768) { s = -32768; stat_clipped++; }
-			if (s) { stat_nonzero++; int32_t a = s < 0 ? -s : s; if (a > stat_peak) stat_peak = a; }
-			buf[i * 2 + 0] = (int16_t)s; /* L */
-			buf[i * 2 + 1] = (int16_t)s; /* R */
+			int32_t l = mix[i], r = mixR[i];
+			if (l > 32767) { l = 32767; stat_clipped++; } else if (l < -32768) { l = -32768; stat_clipped++; }
+			if (r > 32767) { r = 32767; stat_clipped++; } else if (r < -32768) { r = -32768; stat_clipped++; }
+			if (l | r) { stat_nonzero++; int32_t a = l < 0 ? -l : l, b = r < 0 ? -r : r; if (b > a) a = b; if (a > stat_peak) stat_peak = a; }
+			buf[i * 2 + 0] = (int16_t)l;
+			buf[i * 2 + 1] = (int16_t)r;
 		}
 	}
 #ifdef N64
@@ -1696,15 +1763,15 @@ int sound_render(int16_t *buf, int max_samples)
 #endif
 
 #if defined(SND_SELFTEST) && defined(N64)
-	/* Stream 150 frames of mono output (from frame 170) to the debug log as
-	 * hex, so the waveform can be rebuilt and analysed off-target.  Streamed,
+	/* Stream 4 s of the left channel (from the render after cmd $5F) to the
+	 * debug log as hex, so the waveform can be rebuilt and analysed off-target.  Streamed,
 	 * not buffered: the PB-ROM allocation leaves very little heap to spare. */
 	{
 		enum { CAP_SAMPLES = 88200 };   /* 4 s, starting with the first render after cmd $5F */
 		static int cap_n = 0;
 		if (selftest_cap_armed && cap_n < CAP_SAMPLES) {
 			static const char hx[] = "0123456789abcdef";
-			if (cap_n == 0) debugf("[WAV] begin rate=22050\n");
+			if (cap_n == 0) debugf("[WAV] begin rate=22050 (z80 frame %.1f, audio frame %.1f)\n", ST_WHEN());
 			for (int i = 0; i < nsamples && cap_n < CAP_SAMPLES; i += 46) {
 				char line[46 * 4 + 1]; int k = 0;
 				for (int j = 0; j < 46 && i + j < nsamples && cap_n < CAP_SAMPLES; j++, cap_n++) {
@@ -1718,6 +1785,9 @@ int sound_render(int16_t *buf, int max_samples)
 			if (cap_n >= CAP_SAMPLES) debugf("[WAV] end\n");
 		}
 	}
+#endif
+#ifdef SND_SELFTEST
+	st_rendered += nsamples;
 #endif
 
 	return nsamples;

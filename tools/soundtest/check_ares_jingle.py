@@ -6,7 +6,10 @@ ours = wav_from_log(LOG)
 if len(ours) < 44100:
     C.check("ares capture", False, f"only {len(ours)} samples in {LOG}"); sys.exit(1)
 L = resample(load(f"{W}/ref_st_l.pcm"), YM_RATE, OUT_RATE); G = resample(load(f"{W}/ref_st_ssg.pcm"), YM_RATE, OUT_RATE)
-ref = 0.5 * L + (0.84 / 0.98 * 0.5) * G
+# The SSG part is DC-blocked like our output (and the board's output capacitor):
+# the driver toggles the mixer with volume set, which in ymfm leaves a large DC
+# offset that would otherwise dominate the 0-500 Hz band.
+ref = 0.5 * L + (0.84 / 0.98 * 0.5) * highpass(G)
 t0 = 159 * 368; seg = ref[t0 - 2000:t0 + len(ours) + 4000]
 env = lambda x: np.convolve(np.abs(x), np.ones(110) / 110, 'same')
 eo = env(ours[:44100]); best = (-1, 0)

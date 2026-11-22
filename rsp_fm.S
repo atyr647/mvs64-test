@@ -16,7 +16,7 @@ exp_tab:    .space 512       /* 256 x uint16_t */
     .bss
     .align 3
 chan_state:  .space 232       /* YM2610: 4 channels * 56 + 8 header; multiple of 8 so work_out stays DMA-aligned */
-work_out:   .space 1024      /* up to 256 x int32_t output samples */
+work_out:   .space 1024      /* up to 128 stereo samples: int32 L,R interleaved */
 rdram_state: .space 4        /* saved RDRAM addr for state DMA back */
 rdram_out:   .space 4        /* saved RDRAM addr for output DMA */
 
@@ -76,9 +76,9 @@ cmd_fm_render:
     jal     DMAIn
     nop
 
-    /* Clear output buffer */
+    /* Clear output buffer (stereo: 8 bytes per sample) */
     li      t3, %lo(work_out)
-    sll     t4, k1, 2
+    sll     t4, k1, 3
     add     t5, t3, t4
 clear_loop:
     sw      zero, 0(t3)
@@ -338,8 +338,9 @@ mem_op1:
 mem_done:
 
     /* ============ Accumulate output ============ */
+    /* channel sample = sum of the carriers selected by out_flags */
     lbu     t3, 53(v1)
-    lw      t0, 0(k0)
+    move    t0, zero
 
     andi    t8, t3, 1
     beqz    t8, no_op1
@@ -361,8 +362,23 @@ no_m2:
     nop
     addu    t0, t0, s5
 no_c2:
-    sw      t0, 0(k0)
-    addiu   k0, k0, 4
+    /* pan (byte 55): bit7 = left, bit6 = right */
+    lbu     t3, 55(v1)
+    andi    t8, t3, 0x80
+    beqz    t8, no_left
+    nop
+    lw      t1, 0(k0)
+    addu    t1, t1, t0
+    sw      t1, 0(k0)
+no_left:
+    andi    t8, t3, 0x40
+    beqz    t8, no_right
+    nop
+    lw      t1, 4(k0)
+    addu    t1, t1, t0
+    sw      t1, 4(k0)
+no_right:
+    addiu   k0, k0, 8
 
     /* ============ Advance phases (AFTER all operators) ============ */
     lw      t0, 0(v1)
@@ -405,7 +421,7 @@ chan_next:
     /* ---- DMA output to RDRAM ---- */
     lw      s0, %lo(rdram_out)
     li      s4, %lo(work_out)
-    sll     t0, k1, 2
+    sll     t0, k1, 3
     addiu   t0, t0, 7
     andi    t0, t0, 0xFFF8
     addiu   t0, t0, -1

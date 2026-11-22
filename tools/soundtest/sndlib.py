@@ -56,6 +56,14 @@ def peaks(x, count=5, minf=60, sep=25):
         if len(out) == count: break
     return sorted(int(round(v)) for v in out)
 
+def peak_freq(x, rate=OUT_RATE):
+    """Strongest partial in Hz, ~0.05 Hz precision (Hann, 16x zero-pad, parabolic fit)."""
+    n = len(x); N = 1 << int(np.ceil(np.log2(n * 16)))
+    s = np.log(np.abs(np.fft.rfft(x * np.hanning(n), N)) + 1e-9)
+    i = int(np.argmax(s[1:-1])) + 1
+    d = 0.5 * (s[i - 1] - s[i + 1]) / (s[i - 1] - 2 * s[i] + s[i + 1])
+    return (i + d) * rate / N
+
 def wav_from_log(path):
     """Rebuild the [WAV] hex capture (SND_SELFTEST build) from an ares log."""
     out = []

@@ -1,5 +1,5 @@
 // Replay a YM2610 register trace through ymfm at 55.5 kHz.
-// usage: ymfm_play <vrom> <trace> <out_fm_adpcm.pcm> <out_ssg.pcm> <n22050samples> <fm_channel_mask_hex>
+// usage: ymfm_play <vrom> <trace> <out_fm_adpcm_L.pcm> <out_ssg.pcm> <n22050samples> <fm_channel_mask_hex> [out_fm_adpcm_R.pcm]
 // (mask 0 = FM silent; 36 = the YM2610's four FM channels)
 #include "ymfm_opn.h"
 #include <cstdio>
@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
   ymfm::ym2610 chip(I, (uint8_t)strtol(argv[6],0,16));
   chip.set_fidelity(ymfm::OPN_FIDELITY_MED);
   chip.reset();
-  FILE* tf = fopen(argv[2], "r"); FILE* oa = fopen(argv[3], "wb"); FILE* os = fopen(argv[4], "wb");
+  FILE* tf = fopen(argv[2], "r"); FILE* oa = fopen(argv[3], "wb"); FILE* os = fopen(argv[4], "wb"); FILE* orr = argc > 7 ? fopen(argv[7], "wb") : nullptr;
   long total22 = atol(argv[5]);
   const double rate = 8000000.0 / 144;   // 55555.6 Hz
   long t22; int p; unsigned a, v; int have = fscanf(tf, "%ld %d %x %x", &t22, &p, &a, &v) == 4;
@@ -32,5 +32,6 @@ int main(int argc, char** argv) {
     chip.generate(&out, 1);
     int16_t l = (int16_t)out.data[0], s = (int16_t)out.data[2];
     fwrite(&l, 2, 1, oa); fwrite(&s, 2, 1, os);
+    if (orr) { int16_t rr = (int16_t)out.data[1]; fwrite(&rr, 2, 1, orr); }
   }
 }
