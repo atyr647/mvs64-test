@@ -65,7 +65,29 @@ other way: +266 KB of code, 52.9 -> 46.5 FPS (frames 2400-4000).
 profile of the current build (most hot code now native) gave 44.7: no
 better than no layout, so the original list stays.
 
-**The 52.9 FPS layout is fragile.** Nearly every perturbation drops it to
+**Correction (later): the 52.9 FPS build had no music.** Its sound driver
+sat parked in its RAM loop at $FFFD for 116 s of the run (Z80 PC in the
+`[SND]` lines; `reg1`/`reg2` YM writes stay 0), so the Z80 cost nothing.
+The game sends $1B (on this driver: park at $FFFD), waits ~14 ms, then $03
+(reset). The Z80 follows the real-time audio clock and, when ahead of the
+audio, got no cycles between the two writes, so $03 could overtake $1B;
+the reset then ran first and the driver parked for good. Whether that
+happened depended on host speed, so it looked like layout luck. Fixed by
+`sound_sync_command()`: before a command write the Z80 runs at least as many
+cycles since the previous command as on hardware.
+
+The other half of the "fragility" was D-cache placement: the VR4300 D-cache
+is 8 KB direct-mapped, and `m68ki_cpu`, the top-level opcode table and
+`m68ki_remaining_cycles` shifted with any change to static data. In one
+build the cycle counter shared a cache line with the CPU struct: 28 FPS
+from boot. They now live in one 8 KB-aligned block at a fixed cache offset
+(`m68ki_hot`, m68kcpu.h). Shifting all static data by 0x1a0 bytes now
+changes FPS by less than 0.2%.
+
+With music working in the whole run (frames 2400-4000 / 4000-6000 /
+6000-9000): 44.9 / 42.4 / 42.2 FPS before, 48.2 / 45.3 / 41.3 after.
+
+**Old text, before the correction:** the 52.9 FPS layout is fragile. Nearly every perturbation drops it to
 ~44-46 FPS: the interpreter at -O3 (44.8) or -Os (44.7), a regenerated hot
 list (44.7), even adding a few instructions to `main` (45.3). Deliberate
 placement did not recover it: pinning the I/O path, the memory wrappers and

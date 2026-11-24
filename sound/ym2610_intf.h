@@ -57,6 +57,7 @@ int sound_pump(void);
  * (master_clock_in_frame in 24 MHz units).  Call before touching the
  * command/reply latches from the 68K side. */
 void sound_sync(int64_t master_clock_in_frame);
+void sound_sync_command(int64_t master_clock_in_frame);   /* before a 68K command write */
 
 /* Send a command from the 68K to the Z80 (triggers NMI).
  * Called from hw.c when 68K writes to 0x320000. */

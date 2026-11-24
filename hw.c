@@ -179,7 +179,7 @@ void write_hwio(uint32_t addr, uint32_t val, int sz)  {
 
 	} else if ((addr>>16) == 0x32) switch (addr&0xFFFF) {
 		case 0x00: assert(sz==1);
-			sound_sync(emu_clock_frame());   /* let the Z80 finish earlier commands first */
+			sound_sync_command(emu_clock_frame());   /* let the Z80 finish earlier commands first */
 			sound_command(val);
 			return;
 

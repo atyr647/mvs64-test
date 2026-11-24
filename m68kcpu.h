@@ -1010,8 +1010,24 @@ typedef struct m68ki_cpu_core_s
 } m68ki_cpu_core;
 
 #ifndef M68K_RECOMPILER
-extern m68ki_cpu_core m68ki_cpu;
-extern sint           m68ki_remaining_cycles;
+/* The interpreter's hottest data, in one block placed at a chosen D-cache
+ * index. The VR4300 D-cache is 8 KB direct-mapped: the CPU struct and the
+ * opcode table used to sit at cache offsets 0x000-0x3ff, the same lines as
+ * the start of every 64 KB-aligned buffer (WORK_RAM, BACKUP_RAM, ...) and
+ * each other, and missed about 2800 times per frame. The block is 8 KB
+ * aligned; the padding moves the data to offset M68K_HOT_OFFSET. */
+#ifndef M68K_HOT_OFFSET
+#define M68K_HOT_OFFSET 0x800
+#endif
+typedef struct {
+	char pad[M68K_HOT_OFFSET];
+	m68ki_cpu_core cpu;
+	sint remaining_cycles;
+	void (**dispatch[256])(void) __attribute__((aligned(16)));   /* opcode >> 8 -> 256 handlers */
+} m68ki_hot_t;
+extern m68ki_hot_t m68ki_hot;
+#define m68ki_cpu              (m68ki_hot.cpu)
+#define m68ki_remaining_cycles (m68ki_hot.remaining_cycles)
 #endif
 
 extern uint           m68ki_tracing;

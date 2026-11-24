@@ -66,7 +66,7 @@ extern void m68ki_build_opcode_table(void);
  * (same instruction type) share a 1KB sub-table that fits in just 64 cache
  * lines. Only the actively-used sub-tables need to be in D-cache at once. */
 typedef void (*m68k_handler_t)(void);
-static m68k_handler_t *m68k_dispatch_l2[256];
+#define m68k_dispatch_l2 (m68ki_hot.dispatch)
 
 static void m68k_init_dispatch(void) {
 	for (int i = 0; i < 256; i++) {
@@ -85,7 +85,6 @@ static void m68k_init_dispatch(void) {
 /* ======================================================================== */
 
 int  m68ki_initial_cycles;
-int  m68ki_remaining_cycles = 0;                     /* Number of clocks remaining */
 uint m68ki_tracing = 0;
 uint m68ki_address_space;
 
@@ -104,8 +103,8 @@ const char *const m68ki_cpu_names[] =
 };
 #endif /* M68K_LOG_ENABLE */
 
-/* The CPU core */
-m68ki_cpu_core m68ki_cpu = {0};
+/* The CPU core, the cycle counter and the opcode table (see m68kcpu.h) */
+m68ki_hot_t m68ki_hot __attribute__((aligned(0x2000)));
 
 #if M68K_EMULATE_ADDRESS_ERROR
 #ifdef _BSD_SETJMP_H

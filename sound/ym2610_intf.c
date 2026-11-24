@@ -1668,6 +1668,36 @@ void sound_sync(int64_t master_clock_in_frame)
 	}
 }
 
+/* A command write from the 68K.  Besides the usual sync, the Z80 must have run
+ * at least as long since the previous command as on hardware (the 68K master
+ * clock / 6).  The Z80 normally follows the real-time audio clock, and when it
+ * is ahead of the audio it gets no cycles inside a frame, so two commands
+ * written ~14 ms apart could reach it back to back.  Blazing Star sends
+ * $1B (park the driver in its RAM loop at $FFFD), waits, then $03 (reset):
+ * if $03 overtakes $1B, the reset runs first and the driver then parks for
+ * good, silent until the next $03 (minutes later). */
+static int64_t cmd_last_master = -1;   /* absolute 68K master clock of the last command */
+static uint64_t cmd_last_z80;          /* z80_time when it was written */
+
+void sound_sync_command(int64_t master_clock_in_frame)
+{
+	if (!z80_has_rom) return;
+	sound_sync(master_clock_in_frame);
+	int64_t now = (int64_t)stat_update_calls * 400000 + master_clock_in_frame;
+	if (cmd_last_master >= 0 && now > cmd_last_master) {
+		int64_t need = (now - cmd_last_master) / 6;
+		if (need > Z80_CLOCK / 10) need = Z80_CLOCK / 10;   /* a long gap needs no more than this */
+		int64_t have = (int64_t)(z80_time - cmd_last_z80);
+		if (need > have) {
+			int c = (int)(need - have);
+			z80_run(c);
+			z80_frame_done += c;
+		}
+	}
+	cmd_last_master = now;
+	cmd_last_z80 = z80_time;
+}
+
 /* Once per emulated frame: frame counter + (self-test) command injection */
 static void snd_frame_tick(void)
 {
