@@ -52,8 +52,14 @@ Two emulation bugs found on the way:
   frame, so a register write could land a sample earlier or later depending
   on the frame schedule. It is now absolute.
 
+**68K memory helpers forced inline** (`always_inline` in m68kinline.h): GCC
+had kept 25 out-of-line copies of `m68k_read/write_memory_*`, called from
+every interpreter handler (11% of sampled CPU time). Real FPS over the same
+game frames: 43.9 -> 50.7 (frames 2400-6000), 39.0 -> 41.1 (6000-9000).
+
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
-11%. 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter
+11% (before the inlining change; profiling builds no longer represent the
+production layout well, see tools/prof/README.md). 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter
 spends ~270 clocks per interpreted instruction, mostly cache misses.
 
 ## Empirical Findings (November 2026, ares)

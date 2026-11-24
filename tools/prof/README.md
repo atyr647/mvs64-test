@@ -27,7 +27,10 @@ code, so a change that shifts work onto those can look faster there and
 still lower the frame rate: always confirm with the real FPS of a
 production build (`grep ^FPS`, mean from 40 s on). Moving the audio to the
 RSP high-priority queue measured 1.5% better in `[XSUM]` and 33% worse in
-FPS.
+FPS. Profiling builds also perturb code layout: forcing the 68K memory
+helpers inline looked 3% worse in `[XSUM]` and was 15% faster for real.
+Compare builds with `fps_by_frames.sh` on production logs: FPS over the same
+emulated frames, i.e. the same game content.
 
 `frametime.sh <log> [from to]` gives the mean frame cost from the `[PROFILE]`
 lines of any N64 build. `dasm68k.c` disassembles a range of the P-ROM
