@@ -56,6 +56,8 @@ Two emulation bugs found on the way:
 had kept 25 out-of-line copies of `m68k_read/write_memory_*`, called from
 every interpreter handler (11% of sampled CPU time). Real FPS over the same
 game frames: 43.9 -> 50.7 (frames 2400-6000), 39.0 -> 41.1 (6000-9000).
+Forcing the next level too (`m68ki_read/write_*_fc`, push/pull) went the
+other way: +266 KB of code, 50.7 -> 45.0 FPS.
 
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
 11% (before the inlining change; profiling builds no longer represent the
