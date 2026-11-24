@@ -18,6 +18,14 @@ void m68k_write_memory_8_slow(unsigned int address, unsigned int value);
 void m68k_write_memory_16_slow(unsigned int address, unsigned int value);
 void m68k_write_memory_32_slow(unsigned int address, unsigned int value);
 
+/* The dispatch loop and these helpers (when the compiler keeps them out of
+ * line) go first in the hot interpreter block, see m68kops_layout.h. */
+#ifdef N64
+#define M68K_HOT __attribute__((section(".text.m68k.0000")))
+#else
+#define M68K_HOT
+#endif
+
 // Inline fast-path memory access.
 // The NeoGeo 68K spends most of its time fetching instructions from P-ROM
 // (0x0xxxxx) and accessing WORK_RAM (0x1xxxxx). By inlining these two cases,
@@ -30,7 +38,7 @@ void m68k_write_memory_32_slow(unsigned int address, unsigned int value);
 // checked first since it's the most common data access target during
 // gameplay. P-ROM (bank 0) is second for table/constant lookups.
 
-static inline unsigned int m68k_read_memory_16(unsigned int address) {
+M68K_HOT static inline unsigned int m68k_read_memory_16(unsigned int address) {
 	unsigned int bank = (address >> 20) & 0xF;
 	if (__builtin_expect(bank == 1, 1))
 		return BE16(*(uint16_t*)(WORK_RAM + (address & 0xFFFF)));
@@ -41,7 +49,7 @@ static inline unsigned int m68k_read_memory_16(unsigned int address) {
 	return m68k_read_memory_16_slow(address);
 }
 
-static inline unsigned int m68k_read_memory_8(unsigned int address) {
+M68K_HOT static inline unsigned int m68k_read_memory_8(unsigned int address) {
 	unsigned int bank = (address >> 20) & 0xF;
 	if (__builtin_expect(bank == 1, 1))
 		return *(uint8_t*)(WORK_RAM + (address & 0xFFFF));
@@ -52,7 +60,7 @@ static inline unsigned int m68k_read_memory_8(unsigned int address) {
 	return m68k_read_memory_8_slow(address);
 }
 
-static inline unsigned int m68k_read_memory_32(unsigned int address) {
+M68K_HOT static inline unsigned int m68k_read_memory_32(unsigned int address) {
 	unsigned int bank = (address >> 20) & 0xF;
 	if (__builtin_expect(bank == 1, 1))
 		return BE32(*(u_uint32_t*)(WORK_RAM + (address & 0xFFFF)));
@@ -63,7 +71,7 @@ static inline unsigned int m68k_read_memory_32(unsigned int address) {
 	return m68k_read_memory_32_slow(address);
 }
 
-static inline void m68k_write_memory_8(unsigned int address, unsigned int value) {
+M68K_HOT static inline void m68k_write_memory_8(unsigned int address, unsigned int value) {
 	if (__builtin_expect(((address >> 20) & 0xF) == 1, 1)) {
 		*(uint8_t*)(WORK_RAM + (address & 0xFFFF)) = value;
 		return;
@@ -71,7 +79,7 @@ static inline void m68k_write_memory_8(unsigned int address, unsigned int value)
 	m68k_write_memory_8_slow(address, value);
 }
 
-static inline void m68k_write_memory_16(unsigned int address, unsigned int value) {
+M68K_HOT static inline void m68k_write_memory_16(unsigned int address, unsigned int value) {
 	if (__builtin_expect(((address >> 20) & 0xF) == 1, 1)) {
 		*(uint16_t*)(WORK_RAM + (address & 0xFFFF)) = BE16(value);
 		return;
@@ -79,7 +87,7 @@ static inline void m68k_write_memory_16(unsigned int address, unsigned int value
 	m68k_write_memory_16_slow(address, value);
 }
 
-static inline void m68k_write_memory_32(unsigned int address, unsigned int value) {
+M68K_HOT static inline void m68k_write_memory_32(unsigned int address, unsigned int value) {
 	if (__builtin_expect(((address >> 20) & 0xF) == 1, 1)) {
 		*(u_uint32_t*)(WORK_RAM + (address & 0xFFFF)) = BE32(value);
 		return;

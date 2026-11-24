@@ -970,7 +970,25 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 
 /* Execute some instructions until we use up num_cycles clock cycles */
 /* ASG: removed per-instruction interrupt checks */
-int m68k_execute(int num_cycles)
+#ifdef PROFILER
+extern unsigned long prof_insn, prof_hle, prof_skipcyc;
+#endif
+#if defined(PROFILER_OPS) || defined(PROFILER_PCS)
+uint32_t prof_op_fn[2048], prof_op_cnt[2048]; int prof_op_on;
+#endif
+#ifdef PROFILER_DISP
+typedef struct { uint64_t cyc, ic, dc; } xprof_t;
+xprof_t xp_disp, xp_hnd;
+static inline uint64_t xprof_read(uint64_t code) {
+	register int64_t slot asm("t0") = -1;
+	register uint64_t v asm("t1") = code;
+	asm volatile(".word 0x42000029 | (8 << 20) | (9 << 15)" : "+r"(v) : "r"(slot));
+	return v;
+}
+static inline void xp_begin(xprof_t *p) { p->cyc -= xprof_read(0); p->ic -= xprof_read(0x11); p->dc -= xprof_read(0x21); }
+static inline void xp_end(xprof_t *p)   { p->cyc += xprof_read(0); p->ic += xprof_read(0x11); p->dc += xprof_read(0x21); }
+#endif
+M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 {
 	/* eat up any reset cycles */
 	if (RESET_CYCLES) {
@@ -997,6 +1015,9 @@ int m68k_execute(int num_cycles)
 		//rasky: disable bus error for performance
 		//m68ki_check_bus_error_trap();
 
+#ifdef PROFILER_DISP
+		xp_begin(&xp_disp);
+#endif
 		/* Main loop.  Keep going until we run out of clock cycles. */
 		do
 		{
@@ -1020,6 +1041,9 @@ int m68k_execute(int num_cycles)
 			 * at whatever PC the HLE function left us at. */
 			const HLEFunc *hle = hle_get_func(REG_PC);
 			if (hle) {
+#ifdef PROFILER
+				prof_hle++;
+#endif
 				REG_PPC = REG_PC;
 				REG_PC = hle->func(&m68ki_cpu, &m68ki_remaining_cycles, REG_PC);
 				continue;
@@ -1027,9 +1051,38 @@ int m68k_execute(int num_cycles)
 #endif
 			REG_PPC = REG_PC;
 			REG_IR = m68ki_read_imm_16();
+#ifdef PROFILER
+			prof_insn++;
+#endif
+#ifdef PROFILER_PCS
+			if (prof_op_on) {   /* interpreted instructions per 32-byte block of 68K code */
+				uint32_t fn = (REG_PPC >> 5) + 1, h = (fn * 2654435761u) >> 21;
+				while (prof_op_fn[h] != fn && prof_op_fn[h] != 0) h = (h + 1) & 2047;
+				prof_op_fn[h] = fn; prof_op_cnt[h]++;
+			}
+#endif
+#ifdef PROFILER_OPS
+			if (prof_op_on) {   /* per-handler execution counts, open-addressed by handler address */
+				uint32_t fn = (uint32_t)m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF], h = (fn * 2654435761u) >> 22;
+				while (prof_op_fn[h] != fn && prof_op_fn[h] != 0) h = (h + 1) & 1023;
+				prof_op_fn[h] = fn; prof_op_cnt[h]++;
+			}
+#endif
+#ifdef PROFILER_DISP
+			{	/* split the 68K cost: xp_disp = fetch + table lookup, xp_hnd = handler body */
+				void (*fn)(void) = m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF];
+				xp_end(&xp_disp); xp_begin(&xp_hnd);
+				fn();
+				xp_end(&xp_hnd); xp_begin(&xp_disp);
+			}
+#else
 			m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF]();
+#endif
 		} while(GET_CYCLES() > 0);
 
+#ifdef PROFILER_DISP
+		xp_end(&xp_disp);
+#endif
 		/* set previous PC to current PC for the next entry into the loop */
 		REG_PPC = REG_PC;
 	}
@@ -1063,8 +1116,14 @@ void m68k_modify_timeslice(int cycles)
 	ADD_CYCLES(cycles);
 }
 
+#ifdef PROFILER
+unsigned long prof_insn, prof_hle, prof_skipcyc;
+#endif
 void m68k_consume_timeslice(void)
 {
+#ifdef PROFILER
+	if (GET_CYCLES() > 0) prof_skipcyc += GET_CYCLES();
+#endif
 	SET_CYCLES(0);
 }
 

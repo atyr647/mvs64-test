@@ -1903,14 +1903,7 @@ static int render_segment(int16_t *buf, int max_samples)
 		adpcmb_render(ml, mr, n);
 		uint32_t q3 = TICKS_READ();
 		prof_ssg += TICKS_DISTANCE(q0, q1); prof_a += TICKS_DISTANCE(q1, q2); prof_b += TICKS_DISTANCE(q2, q3);
-		rspq_wait();
-		/* the RSP wrote the state and this chunk's output to RDRAM: drop the
-		 * stale cached copies (whole lines around the chunk) */
-		data_cache_hit_invalidate(&fm_wrap, sizeof(fm_wrap));
-		{
-			uintptr_t a = (uintptr_t)fm & ~(uintptr_t)15, b = ((uintptr_t)(fm + 2 * n) + 15) & ~(uintptr_t)15;
-			data_cache_hit_invalidate((void *)a, b - a);
-		}
+		rsp_fm_wait();   /* state and output were written by RSP DMA; rsp_fm_render dropped our cached copies */
 		t_wait += TICKS_DISTANCE(q3, TICKS_READ());
 #else
 		memset(fm, 0, n * 2 * sizeof(int32_t));   /* host builds: FM is checked via the C model */

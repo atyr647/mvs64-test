@@ -281,6 +281,7 @@ int main(int argc, char *argv[]) {
 	// that contains subroutine calls, where we can resume execution), there
 	// will be more entries pointing to the same function.
 	struct { uint32_t key; uint32_t value; } *func_pcs = NULL;
+struct { unsigned int key; bool value; } *extra_entries = NULL;
 
 	for (int fx=1;fx<argc;fx++) {
 		if (strchr(argv[fx], '.')) {
@@ -295,6 +296,14 @@ int main(int argc, char *argv[]) {
 			if (PROM) free(PROM);
 			printf("Loading %s (base: %x)...\n", fn, PROM_BASE);
 			PROM = load_rom(fn);
+			continue;
+		}
+
+		// "@pc": an extra entrypoint.  When a function generated later
+		// contains this address, it can also be entered there (e.g. the
+		// place where another routine jumps back into a loop).
+		if (argv[fx][0] == '@') {
+			hmput(extra_entries, strtoul(argv[fx]+1, NULL, 16), true);
 			continue;
 		}
 
@@ -324,6 +333,10 @@ int main(int argc, char *argv[]) {
 		fprintf(out, "#pragma GCC diagnostic ignored \"-Wunused-label\"\n");
 		fprintf(out, "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n");
 		fprintf(out, "\n");
+		// Lay the native functions out next to the interpreter's hot block
+		// (linker script: SORT(.text.m68k.*)), in command-line order.
+		static int func_rank = 0;
+		fprintf(out, "__attribute__((section(\".text.m68k.%04d\")))\n", 10 + func_rank++);
 		fprintf(out, "uint32_t func_%08X(m68ki_cpu_core * restrict __m68ki_cpu, int * restrict __m68ki_remaining_cycles, uint32_t __entry_pc) {\n", pc);
 		fprintf(out, "\tif (__builtin_expect(__entry_pc != 0x%x, 0)) goto find_entrypoint;\n\n", pc);
 
@@ -342,6 +355,28 @@ int main(int argc, char *argv[]) {
 			const opcode_handler_struct *oph = decode_opcode(op);
 			strcpy(body, shget(op_interpreter, oph->opcode_handler));
 
+			if (pc != initial_pc && hmgeti(extra_entries, pc) >= 0) {
+				arrput(entrypoints, pc);
+				hmput(func_pcs, pc, initial_pc);
+			}
+
+			// Instructions the native runtime (m68k_recompiler.h) cannot do:
+			// anything that changes SR / takes an exception.  Leave them to the
+			// interpreter and come back in right after.
+			static const char *unsupported[] = { "m68ki_set_sr", "m68ki_exception_", "m68ki_stack_frame", "m68ki_check_interrupts", "CPU_STOPPED", NULL };
+			bool bail = false;
+			for (const char **u = unsupported; *u; u++) if (strstr(body, *u)) bail = true;
+			if (bail) {
+				fprintf(out, "\top_%08X: { REG_PC = 0x%x; goto exit; } // %s (interpreted)\n", pc, pc, disasm);
+				arrput(entrypoints, pc+oplen);
+				hmput(func_pcs, pc+oplen, initial_pc);
+				bool ends = strstr(oph->opcode_handler, "m68k_op_rte") || strstr(oph->opcode_handler, "m68k_op_stop");
+				pc += oplen; func += oplen;
+				if (++opcount > 10000) panic("function too long -- missing end of function");
+				if (ends && hmgeti(forward_jumps, pc) < 0) break;
+				continue;
+			}
+
 			fprintf(out, "\top_%08X: { // %s\n", pc, disasm);
 			fprintf(out, "\t\t// %s\n", oph->opcode_handler);
 			fprintf(out, "\t\tREG_PC = 0x%x;\n", pc+2);
@@ -355,17 +390,35 @@ int main(int argc, char *argv[]) {
 			}
 
 			static const char *fake_return[] = { "m68k_op_lsl_", "m68k_op_lsr_", "m68k_op_sne_", NULL };
-			static const char *branches_off_8[] =  { "m68k_op_beq_8",  "m68k_op_bne_8",  "m68k_op_blt_8",  "m68k_op_bgt_8",  "m68k_op_bcc_8",  "m68k_op_dbf_8",  "m68k_op_bra_8",  NULL };
-			static const char *branches_off_16[] = { "m68k_op_beq_16", "m68k_op_bne_16", "m68k_op_blt_16", "m68k_op_bgt_16", "m68k_op_bcc_16", "m68k_op_dbf_16", "m68k_op_bra_16", NULL };
+			/* every Bcc condition (the bodies in m68kops.c all have the same shape), plus DBF */
+			#define BCC_ALL(sz) "m68k_op_bhi_" sz, "m68k_op_bls_" sz, "m68k_op_bcc_" sz, "m68k_op_bcs_" sz, "m68k_op_bne_" sz, "m68k_op_beq_" sz, "m68k_op_bvc_" sz, "m68k_op_bvs_" sz, \
+				"m68k_op_bpl_" sz, "m68k_op_bmi_" sz, "m68k_op_bge_" sz, "m68k_op_blt_" sz, "m68k_op_bgt_" sz, "m68k_op_ble_" sz, "m68k_op_dbf_" sz, "m68k_op_bra_" sz
+			static const char *branches_off_8[] =  { BCC_ALL("8"), NULL };
+			static const char *branches_off_16[] = { BCC_ALL("16"), NULL };
 			static const char *jump_tables[] = { "m68k_op_jmp_32_pc", NULL };
 			static const char *calls[] = { "m68k_op_bsr_", "m68k_op_jsr_", NULL };
 
 			bool is_backward_branch = false;
-			char goto_next[24]; unsigned int target=0;
+			char goto_next[256]; unsigned int target=0;
+			/* Branch to `target`:
+			 *  - before the function's entry: not part of this function, bail
+			 *    to the interpreter there;
+			 *  - backward (a loop): stay native while the timeslice lasts;
+			 *    when it is used up, leave at the loop head, which is made an
+			 *    entrypoint so the next timeslice resumes native.  Without
+			 *    this a long loop overruns the slice and delays raster IRQs.
+			 *  - forward: plain goto. */
+			#define BRANCH_TO(target) ({ \
+				if ((target) < initial_pc) \
+					sprintf(goto_next, "{ REG_PC = 0x%x; goto exit; }", (target)); \
+				else if ((target) <= pc) { \
+					sprintf(goto_next, "{ if (__builtin_expect(*__m68ki_remaining_cycles <= 0, 0)) { REG_PC = 0x%x; goto exit; } goto op_%08X; }", (target), (target)); \
+					if ((target) != initial_pc) { arrput(entrypoints, (target)); hmput(func_pcs, (target), initial_pc); } \
+				} else sprintf(goto_next, "goto op_%08X;", (target)); })
 			if (stranyprefix(oph->opcode_handler, branches_off_16)) {
 				target = pc + 2 + (int16_t)be16(func+2);
 				is_backward_branch = target < pc;
-				sprintf(goto_next, "goto op_%08X;", target);
+				BRANCH_TO(target);
 				if (!strstartwith(oph->opcode_handler, "m68k_op_bra_")) {
 					replace_word(body, "m68ki_branch_16(offset);", "", 1);
 					replace_word(body, "return;", goto_next, 1);
@@ -375,7 +428,7 @@ int main(int argc, char *argv[]) {
 			} else if (stranyprefix(oph->opcode_handler, branches_off_8)) {
 				target = pc + 2 + (int8_t)op;
 				is_backward_branch = target < pc;
-				sprintf(goto_next, "goto op_%08X;", target);
+				BRANCH_TO(target);
 				replace_word(body, "m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));", goto_next, 1);
 				if (!strstartwith(oph->opcode_handler, "m68k_op_bra_"))
 					replace_word(body, "return;", "", 1);
@@ -416,7 +469,15 @@ int main(int argc, char *argv[]) {
 					panic("unsupported jump table instruction: %s", disasm);
 			}
 			if (target > pc) hmput(forward_jumps, target, true);
-		
+
+			// Any other "return;" just ends the instruction early (e.g. the
+			// privileged path of MOVE from SR): continue with the next one.
+			if (!target && strstr(body, "return;")) {
+				char next[64]; sprintf(next, "goto op_%08X;", pc + oplen);
+				replace_word(body, "return;", next, -1);
+				hmput(forward_jumps, pc + oplen, true);
+			}
+
 			fprintf(out, "%s", body);
 
 			// If the function contains a jump or it's a subroutine call, it's

@@ -159,6 +159,7 @@
 
 #define m68ki_jump(pc)       ({ REG_PC = pc; })
 #define m68ki_branch_8(pc)   ({ REG_PC += MAKE_INT_8(pc); })
+#define m68ki_branch_16(pc)  ({ REG_PC += MAKE_INT_16(pc); })
 
 #define m68ki_cpu (*__m68ki_cpu)
 #define m68ki_remaining_cycles (*__m68ki_remaining_cycles)

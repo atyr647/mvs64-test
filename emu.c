@@ -64,6 +64,28 @@ static EmuEvent events[MAX_EVENTS];
 uint32_t profile_hw_io;
 uint32_t profile_dma_load;
 
+#ifdef PROFILER
+/* ares "emux" counters (needs --setting Developer/HomebrewMode=true): global
+ * CPU cycles and cache misses, read with the XPROFREAD pseudo-instruction. */
+static inline uint64_t xprof_read(uint64_t code) {
+	register int64_t slot asm("t0") = -1;
+	register uint64_t v asm("t1") = code;
+	asm volatile(".word 0x42000029 | (8 << 20) | (9 << 15)" : "+r"(v) : "r"(slot));
+	return v;
+}
+typedef struct { uint64_t cyc, ic, dc; } xprof_t;
+xprof_t xp_68k, xp_snd, xp_draw, xp_all;
+static xprof_t xs_68k, xs_snd, xs_draw, xs_all;   /* sums over a fixed emulated-frame range */
+static unsigned long xs_insn;
+static inline void xp_begin(xprof_t *p) { p->cyc -= xprof_read(0); p->ic -= xprof_read(0x11); p->dc -= xprof_read(0x21); }
+static inline void xp_end(xprof_t *p)   { p->cyc += xprof_read(0); p->ic += xprof_read(0x11); p->dc += xprof_read(0x21); }
+#define XP_BEGIN(p) xp_begin(&(p))
+#define XP_END(p)   xp_end(&(p))
+#else
+#define XP_BEGIN(p)
+#define XP_END(p)
+#endif
+
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
 	if (clock > m68k_clock) {
@@ -71,7 +93,9 @@ static uint64_t m68k_exec(uint64_t clock) {
 		#ifdef USE_FAME
 		int executed = fame_adapter_execute(ncycles);
 		#else
+		XP_BEGIN(xp_68k);
 		int executed = m68k_execute(ncycles);
+		XP_END(xp_68k);
 		#endif
 		m68k_clock += executed;
 	}
@@ -202,9 +226,11 @@ uint32_t emu_render(void *arg) {
 	#ifdef N64
 	uint32_t t0 = TICKS_READ();
 	#endif
+	XP_BEGIN(xp_draw);
 	plat_beginframe();
 	video_render();
 	plat_endframe();
+	XP_END(xp_draw);
 
 	rom_next_frame();
 
@@ -304,15 +330,70 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		/* Sound runs on the audio clock (see sound_pump), so music keeps its
 		 * tempo and the audio interface never starves when FPS < 60. */
-		sound_frame_begin();
+		XP_BEGIN(xp_all);
+		XP_BEGIN(xp_snd); sound_frame_begin(); XP_END(xp_snd);
 		emu_run_frame();
-		sound_pump();
+		XP_BEGIN(xp_snd); sound_pump(); XP_END(xp_snd);
+		XP_END(xp_all);
 		#else
 		emu_run_frame();
 		sound_update(Z80_CLOCK / 60);
 		#endif
 
 		if (!plat_poll()) break;
+		#ifdef PROFILER
+		#ifdef PROFILER_SAMPLE
+		{ extern void prof_frame(int); prof_frame((int)g_frame); }
+		#endif
+		#ifndef XSUM_START
+		#define XSUM_START 1500
+		#define XSUM_END   3000
+		#endif
+		{
+			/* Exact totals over emulated frames [XSUM_START, XSUM_END): comparable
+			 * between builds because AUTOPLAY input is frame-based. */
+			extern unsigned long prof_insn;
+			#if defined(PROFILER_OPS) || defined(PROFILER_PCS)
+			extern uint32_t prof_op_fn[2048], prof_op_cnt[2048]; extern int prof_op_on;
+			#else
+			int prof_op_on = 0; (void)prof_op_on;
+			#endif
+			static xprof_t l68k, lsnd, ldraw, lall; static unsigned long linsn_base;
+			#define XACC(s, p, l) (s).cyc += (p).cyc - (l).cyc, (s).ic += (p).ic - (l).ic, (s).dc += (p).dc - (l).dc
+			static xprof_t t68k, tsnd, tdraw, tall; static unsigned long tinsn;
+			/* running totals (the per-second printer zeroes xp_*, so accumulate deltas here) */
+			XACC(t68k, xp_68k, l68k); XACC(tsnd, xp_snd, lsnd); XACC(tdraw, xp_draw, ldraw); XACC(tall, xp_all, lall);
+			tinsn += prof_insn - linsn_base;
+			l68k = xp_68k; lsnd = xp_snd; ldraw = xp_draw; lall = xp_all; linsn_base = prof_insn;
+			#ifdef PROFILER_STATE
+			if (g_frame % 500 == 0) {
+				/* state fingerprint: equal between two builds = same emulation result */
+				extern uint8_t WORK_RAM[]; uint32_t h = 2166136261u;
+				for (int i = 0; i < 0x10000; i++) h = (h ^ WORK_RAM[i]) * 16777619u;
+				debugf("[STATE] frame=%d workram=%08lx\n", (int)g_frame, (unsigned long)h);
+			}
+			#endif
+			if (g_frame == XSUM_START) { xs_68k = t68k; xs_snd = tsnd; xs_draw = tdraw; xs_all = tall; xs_insn = tinsn; prof_op_on = 1; }
+			if (g_frame == XSUM_END) {
+				int nf = XSUM_END - XSUM_START; prof_op_on = 0;
+				#define XS(name, t, s) debugf("[XSUM] %s cycles=%lu icache_miss=%lu dcache_miss=%lu\n", name, (unsigned long)(((t).cyc - (s).cyc) / nf), (unsigned long)(((t).ic - (s).ic) / nf), (unsigned long)(((t).dc - (s).dc) / nf))
+				XS("all", tall, xs_all); XS("68k", t68k, xs_68k); XS("sound", tsnd, xs_snd); XS("draw", tdraw, xs_draw);
+				debugf("[XSUM] insn=%lu frames=%d\n", (tinsn - xs_insn) / nf, nf);
+				#ifdef PROFILER_DISP
+				{ extern xprof_t xp_disp, xp_hnd; static xprof_t z;
+				  /* totals since boot, per instruction x1000 would be nicer but keep it simple: whole-run sums */
+				  debugf("[XDISP] dispatch cycles=%llu icache_miss=%llu dcache_miss=%llu\n", xp_disp.cyc - z.cyc, xp_disp.ic, xp_disp.dc);
+				  debugf("[XDISP] handlers cycles=%llu icache_miss=%llu dcache_miss=%llu\n", xp_hnd.cyc, xp_hnd.ic, xp_hnd.dc); }
+				#endif
+				#ifdef PROFILER_OPS
+				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFOP] %lx %lu\n", (unsigned long)prof_op_fn[i], (unsigned long)prof_op_cnt[i]);
+				#endif
+				#ifdef PROFILER_PCS
+				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFPC] %lx %lu\n", (unsigned long)((prof_op_fn[i] - 1) << 5), (unsigned long)prof_op_cnt[i]);
+				#endif
+			}
+		}
+		#endif
 
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());

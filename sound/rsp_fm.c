@@ -99,21 +99,44 @@ static void upload_tables(void)
 	tables_uploaded = 1;
 }
 
+static rspq_syncpoint_t fm_sync;
+
+/* Queue one FM render and return at once; rsp_fm_wait() blocks until the RSP
+ * has written the state and the samples back.
+ *
+ * The syncpoint is queued in the same batch as the render.  (Appending it
+ * later, as rspq_wait() does, means waking an RSP that has just gone to sleep
+ * after the render: that wake-up can be lost, and rspq_wait() then times out
+ * with an RSP crash screen.  rspq_wait() would also wait for the RDP to finish
+ * drawing, which the audio does not need.)
+ *
+ * The RSP writes both buffers with DMA, so the CPU must hold no cached copy
+ * of them: the state is flushed and dropped here, the output lines are
+ * dropped here too, and the caller does not touch either until rsp_fm_wait(). */
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf)
 {
 	upload_tables();
 
-	data_cache_hit_writeback(state, (sizeof(*state) + 15) & ~15);
+	data_cache_hit_writeback_invalidate(state, (sizeof(*state) + 15) & ~15);
+	{
+		uintptr_t a = (uintptr_t)out_buf & ~(uintptr_t)15;
+		uintptr_t b = ((uintptr_t)(out_buf + 2 * state->num_samples) + 15) & ~(uintptr_t)15;
+		data_cache_hit_invalidate((void *)a, b - a);
+	}
 
 	rspq_write(fm_ovl_id, CMD_FM_RENDER,
 		   state->num_samples,
 		   PhysicalAddr(state),
 		   PhysicalAddr(out_buf));
+	fm_sync = rspq_syncpoint_new();
 	rspq_flush();
 }
 
+void rsp_fm_wait(void)
+{
+	rspq_syncpoint_wait(fm_sync);
+}
 #else
-/* Non-N64 stubs */
-void rsp_fm_init(void) {}
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf) {}
+void rsp_fm_wait(void) {}
 #endif

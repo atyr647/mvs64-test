@@ -548,5 +548,5 @@ const char* game_ini[65536] = {
 	// Blazing Star: PC 0x43fe dominated ~90% of profile samples in idle
 	// sections — a textbook bne.s *-2 vblank wait loop.  Idle-skip burns
 	// the rest of the timeslice when the 68K branches to this address.
-	[GAME_BLAZSTAR] = "idle_skip=0x43fe\n",
+	[GAME_BLAZSTAR] = "idle_skip=0x3b5c\n",   /* tst.w $101000 ; beq $3b5c: wait for the vblank flag */
 };

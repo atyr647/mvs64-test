@@ -6,6 +6,43 @@ subsystem and roughly ordered by expected impact.
 
 ---
 
+## Empirical Findings (November 2026, ares)
+
+Measured in ares with exact cycle and cache-miss counters (`tools/prof`),
+Blazing Star Stage 1 under `-DAUTOPLAY`, emulated frames 1500–3000.
+
+**Where the time went (before):** 232% of a 60 Hz frame per emulated frame.
+68K 167%, sound 54%, draw 11%. Inside the 68K core, I-cache misses were 38%
+and D-cache misses 37% of the time: the interpreter itself only 25%.
+
+| Change | Frame cost | Notes |
+|---|---|---|
+| Start of session | 268% | |
+| `idle_skip=0x3b5c` | 232% | `0x43fe` was not an idle loop (a return address in the sprite routine): the skip never fired, 0 cycles skipped. The real wait-for-vblank loop is `tst.w $101000 / beq` at `0x3b5c`; 16% of 68K cycles are now skipped in Stage 1, more in menus. |
+| AOT for the real hot code | 145% | `4012 4096 41b8 4f920 3820 3878 4f0c6 11e6 1160`. The April list (`5152`…`5866`) was picked from frame-end PC samples; exact counts show it is entered twice per frame, and the four unrolled functions cost more I-cache misses than they save. Dropped. |
+| Hot code laid out contiguously | 139% | Linker script sorts `.text.m68k.NNNN`: memory helpers, dispatch loop, native functions, then interpreter handlers by measured frequency. |
+
+Result: 26 → 43 FPS in the measured stretch (this is ares's timing model;
+not yet measured on hardware).
+
+Things that did **not** help:
+- FAME core: no idle skip, and it asserts on the paged P-ROM.
+- `USE_DRC`: PBROM allocation fails at boot.
+- Interpreter at `-Os`: fewer I-cache misses but more D-cache misses, slower
+  overall. (It does shrink the ELF by 700 KB, should RAM ever be the limit.)
+- Ordering the handlers alone: −11% I-cache misses, 2% faster. The tail of
+  rarely used handlers still evicts the hot ones; avoiding the interpreter
+  for hot code is what pays.
+
+genhle gained: every Bcc condition, BSR.W, loops that leave at the loop head
+when the timeslice is used up (and resume natively), branches to before the
+function entry, instructions that touch SR handed to the interpreter, and
+`@pc` extra entrypoints.
+
+Remaining 68K cost is spread thin (largest interpreted region 5% of
+instructions); I-cache misses are still ~43% of it. Sound is now 37% of a
+frame per emulated frame.
+
 ## Empirical Findings (April 2026)
 
 Several CPU-side optimization attempts were measured on real hardware running

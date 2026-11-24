@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "m68kcpu.h"
+#include "m68kops_layout.h"   /* profile-guided layout: hot handlers contiguous (I-cache) */
 extern void m68040_fpu_op0(void);
 extern void m68040_fpu_op1(void);
 extern void m68881_mmu_ops();

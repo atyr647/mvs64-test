@@ -108,3 +108,50 @@ void plat_beginframe(void) {
 void plat_endframe(void) {
 	rdpq_detach_show();
 }
+
+#ifdef PROFILER_SAMPLE
+/* Sampling profiler (make ... SND_CFLAGS="-DAUTOPLAY -DPROFILER -DPROFILER_SAMPLE"): a ~2.3 kHz
+ * timer interrupt records the interrupted PC in 64-byte buckets, plus the 68K
+ * PC, between two frame numbers; the histogram is dumped to the debug log and
+ * symbolized off-target with tools/prof/symbolize.py. */
+extern char __text_start[], __text_end[];
+#define PROF_SHIFT 7
+#define PROF_BUCKETS (0x180000 >> PROF_SHIFT)
+static uint16_t prof_hist[PROF_BUCKETS];
+static uint32_t prof_other, prof_total;
+#define PROF_M68K_N 1024
+static uint32_t prof_m68k_pc[PROF_M68K_N]; static uint16_t prof_m68k_cnt[PROF_M68K_N];
+static volatile int prof_on;
+extern uint32_t emu_pc(void);
+
+static void prof_tick(int ovfl) {
+    if (!prof_on) return;
+    uint32_t pc = C0_EPC();
+    uint32_t off = pc - (uint32_t)__text_start;
+    prof_total++;
+    if (off < (PROF_BUCKETS << PROF_SHIFT)) { if (prof_hist[off >> PROF_SHIFT] != 0xFFFF) prof_hist[off >> PROF_SHIFT]++; }
+    else prof_other++;
+    /* 68K PC (as last stored by the core), open-addressed */
+    uint32_t m = emu_pc() & ~1u, h = (m * 2654435761u) >> 22;
+    for (int i = 0; i < 16; i++, h = (h + 1) & (PROF_M68K_N - 1)) {
+        if (prof_m68k_cnt[h] == 0 || prof_m68k_pc[h] == m) { prof_m68k_pc[h] = m; if (prof_m68k_cnt[h] != 0xFFFF) prof_m68k_cnt[h]++; break; }
+    }
+}
+
+void prof_frame(int frame) {
+    static int inited;
+    if (!inited) { inited = 1; timer_init(); new_timer(20011, TF_CONTINUOUS, prof_tick); }
+#ifndef PROF_START
+#define PROF_START 1500
+#define PROF_END   4500
+#endif
+    if (frame == PROF_START) { prof_on = 1; debugf("[PROF] start\n"); }
+    if (frame == PROF_END) {
+        prof_on = 0;
+        debugf("[PROF] total=%lu other=%lu text=%p\n", (unsigned long)prof_total, (unsigned long)prof_other, __text_start);
+        for (int i = 0; i < PROF_BUCKETS; i++) if (prof_hist[i]) debugf("[PROFN] %x %u\n", i << PROF_SHIFT, prof_hist[i]);
+        for (int i = 0; i < PROF_M68K_N; i++) if (prof_m68k_cnt[i]) debugf("[PROFM] %lx %u\n", (unsigned long)prof_m68k_pc[i], prof_m68k_cnt[i]);
+        debugf("[PROF] end\n");
+    }
+}
+#endif

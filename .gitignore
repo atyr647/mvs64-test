@@ -14,3 +14,5 @@ hle_index.h
 # per-ROM output of mvsmakerom (byteswapped game/BIOS data)
 *.n64/
 __pycache__/
+mvs64.ld
+m68kops_layout.h

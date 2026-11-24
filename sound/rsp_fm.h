@@ -55,6 +55,7 @@ void rsp_fm_init(void);
 #define FM_OVERSAMPLE 2
 
 /* Renders state->num_samples (<= 128) stereo samples, int32 L,R interleaved. */
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);
+void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);   /* asynchronous */
+void rsp_fm_wait(void);                                              /* until that render is done */
 
 #endif

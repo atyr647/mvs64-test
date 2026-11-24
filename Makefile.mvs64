@@ -9,6 +9,20 @@ BUILD_DIR = build/mvs64
 
 include $(N64_INST)/include/n64.mk
 
+# Link with a copy of libdragon's n64.ld that places the 68K interpreter's hot
+# code first and contiguous, sorted by section name (.text.m68k.NNNN, hottest
+# first: see m68kops_layout.h).  The VR4300 I-cache is 16 KB direct-mapped, so
+# code within one contiguous 16 KB never evicts itself.
+N64_LDFLAGS := $(subst -Tn64.ld,-Tmvs64.ld,$(N64_LDFLAGS))
+.DEFAULT_GOAL := all
+mvs64.ld: $(N64_LIBDIR)/n64.ld
+	sed 's/^\( *\)\*(\.boot)$$/\1*(.boot)\n\1. = ALIGN(32);\n\1__m68k_hot_start = .;\n\1*(SORT(.text.m68k.*))\n\1__m68k_hot_end = .;/' $< > $@
+# M68K_HOT_LIST=/dev/null gives the unordered layout, for A/B measurements
+M68K_HOT_LIST ?= m68kops_hot.txt
+m68kops_layout.h: $(M68K_HOT_LIST) tools/prof/mklayout.py
+	python3 tools/prof/mklayout.py $< $@
+$(BUILD_DIR)/m68kops.o: m68kops_layout.h
+
 # 68K CPU core selection: USE_FAME=1 for FAME, otherwise Musashi
 ifdef USE_FAME
 src_68k = cpu/fame/famec.c fame_adapter.c
@@ -18,7 +32,8 @@ $(BUILD_DIR)/cpu/fame/famec.o: CFLAGS += -g0 -O2 -fno-expensive-optimizations
 else
 src_68k = m68kcpu.c m68kops.c
 # Musashi's generated opcode file is huge; keep at -O2
-$(BUILD_DIR)/m68kops.o: CFLAGS += -O2
+M68KOPS_OPT ?= -O2
+$(BUILD_DIR)/m68kops.o: CFLAGS += $(M68KOPS_OPT)
 endif
 
 # AOT recompilation ("HLE") for hot 68K functions.  When USE_HLE=1 the build
@@ -27,27 +42,27 @@ endif
 # m68k_execute() then checks hle_get_func(REG_PC) before falling through to
 # the interpreter dispatch.
 #
-# PCs are picked from PROFILE samples during Blazing Star play.  The list
-# below targets a handful of secondary hotspots from heavy and light scene
-# clusters.  Expect the HLE_PCS list to shift whenever the gameplay region
-# changes; re-profile after significant perf work.
+# PCs are picked per game with tools/prof (exact per-PC instruction counts).
+# Re-profile when the game or the scene mix changes.
 #
-# The dominant idle PC (0x43fe — ~90% of profile samples) is intentionally
-# absent: it's handled by the idle-skip check in m68k_run() instead, which
-# burns the remaining timeslice in O(1) rather than executing the busy-wait
-# loop in C.  See game.ini line for blazstar in mvsmakerom.c.
+# The game's wait-for-vblank loop (0x3b5c) is not in the list: it is handled
+# by idle_skip (game.ini, see mvsmakerom.c), which ends the timeslice at once.
 ifdef USE_HLE
-# Hot PCs across the scene-type regions identified by profiling.
-# IMPORTANT: keep this list small.  Each generated hle_*.c contributes a
-# few KB of code/data to RDRAM, and Blazing Star's PBROM allocation needs
-# a 1 MiB-aligned contiguous region — a previous 16-entry list pushed us
-# past that and crashed on boot ("cannot allocate PBROM buffer").  Cap at
-# ~8 entries unless you've verified the game's memory headroom first.
+# Each generated hle_*.c adds code to RDRAM, and the PBROM allocation needs a
+# 1 MiB-aligned contiguous region: check the boot log after growing the list.
+# Keep unrolled straight-line routines out (the April 2026 list 5152 522e 5382
+# 53d2 5866 5cba 5b50 5a26): native code that runs once per call flushes the
+# 16 KB I-cache and measured slower than interpreting it.
 #
-#   light     : 5cba 5b50
-#   heavy     : 5152 522e 5382 53d2 5866
-#   misc      : 5a26
-HLE_PCS = 5cba 5b50 5152 522e 5382 53d2 5a26 5866
+# Blazing Star, Stage 1 (Nov 2026): half of the non-idle 68K time is in the
+# object loop and sprite-list builder at 4012/41b8.
+#   object loop + sprite list builder : 4012 4096 41b8
+#   collision detection               : 4f920
+#   task scheduler / yield            : 3820 3878 (re-entered at 3860)
+#   misc scans and text output        : 4f0c6 11e6 1160
+HLE_PCS = 4012 4096 41b8 4f920 3820 3878 4f0c6 11e6 1160
+# Extra entrypoints inside the functions above (see genhle.c, "@pc")
+HLE_ENTRIES = 3860
 HLE_GEN_C = $(patsubst %,hle_%.c,$(HLE_PCS)) hle_index.c
 HLE_GEN_H = hle_index.h
 HLE_ALL   = $(HLE_GEN_C) $(HLE_GEN_H)
@@ -120,7 +135,7 @@ $(BUILD_DIR)/mvs64-${ROMNAME}.dfs: $(MVS_STAMP)
 
 mvs64-${ROMNAME}.z64: $(BUILD_DIR)/mvs64-${ROMNAME}.dfs
 mvs64-${ROMNAME}.z64: N64_ROM_TITLE="MVS64: ${ROMNAME}"
-$(BUILD_DIR)/mvs64-${ROMNAME}.elf: $(obj)
+$(BUILD_DIR)/mvs64-${ROMNAME}.elf: $(obj) mvs64.ld
 
 mvsmakerom: $(obj_makerom)
 	@echo "    [LD] $@"
@@ -145,7 +160,7 @@ HLE_STAMP = $(BUILD_DIR)/.hle-stamp
 # we only regen when the BIOS/ROM, m68kops.c, or the HLE_PCS list changes.
 $(HLE_STAMP): $(MVS_STAMP) m68kops.c Makefile.mvs64 | genhle
 	@echo "    [HLE] generating $(words $(HLE_PCS)) function(s) from $(ROMDIR)"
-	./genhle $(ROMDIR)/p.rom $(HLE_PCS) $(ROMDIR)/p.bios@c00000
+	./genhle $(ROMDIR)/p.rom $(addprefix @,$(HLE_ENTRIES)) $(HLE_PCS) $(ROMDIR)/p.bios@c00000
 	@mkdir -p $(dir $@)
 	@touch $@
 
