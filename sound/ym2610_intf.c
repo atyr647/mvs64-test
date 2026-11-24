@@ -954,16 +954,6 @@ static const int16_t adpcma_steps[49] = {
 	16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552
 };
 static const int8_t adpcma_step_inc[8] = { -1, -1, -1, -1, 2, 5, 7, 9 };
-/* d = +-((2*(nib&7)+1) * step) / 8 for every step and nibble, built at init */
-static int16_t adpcma_diff[49][16];
-static void adpcma_build_tables(void)
-{
-	for (int s = 0; s < 49; s++)
-		for (int nib = 0; nib < 16; nib++) {
-			int d = ((2 * (nib & 7) + 1) * adpcma_steps[s]) / 8;
-			adpcma_diff[s][nib] = (int16_t)((nib & 8) ? -d : d);
-		}
-}
 
 typedef struct {
 	uint8_t  on;
@@ -975,10 +965,11 @@ typedef struct {
 	uint32_t end;         /* first byte address AFTER the sample (end register + 1) << 8 */
 	uint8_t  byte;        /* byte currently being decoded */
 	uint32_t chunk_base;  /* ROM offset of the chunk in adpcma_buf, or ~0 */
-	int32_t  acc, step;   /* acc: 12-bit unsigned, wraps (&0xFFF); sign-extended on output */
-	int32_t  s0, s1;      /* last two decoded samples, for interpolation */
-	uint32_t frac;
+	uint32_t frac;        /* resampling phase (decoder state: adpcma_rsp) */
 } adpcma_t;
+/* decoder state shared with the RSP, see adpcma_stage() */
+static struct rsp_adpcma_state adpcma_rsp __attribute__((aligned(16)));
+static int32_t adpcma_out[2 * 128] __attribute__((aligned(16)));   /* L,R sums per sample */
 
 static adpcma_t adpcma[6];
 static uint8_t  adpcma_total = 0x3F;      /* total level register, 0..63 */
@@ -995,36 +986,15 @@ static inline int adpcma_fetch(int ch, uint32_t addr)
 	return adpcma_buf[ch][addr & (ADPCMA_CHUNK - 1)];
 }
 
-/* Decode the next native-rate sample of channel ch; returns 0 when finished.
- * Matches ymfm: the end address is inclusive and only its low 20 bits are
- * compared, checked just before fetching each new byte. */
-static int adpcma_decode(int ch)
-{
-	adpcma_t *a = &adpcma[ch];
-	int nib;
-	if (a->hi) {
-		if (((a->pos ^ a->end) & 0xFFFFF) == 0) return 0;
-		a->byte = (uint8_t)adpcma_fetch(ch, a->pos++);
-		nib = a->byte >> 4;
-		a->hi = 0;
-	} else {
-		nib = a->byte & 15;
-		a->hi = 1;
-	}
-
-	a->acc = (a->acc + adpcma_diff[a->step][nib]) & 0xFFF;   /* 12-bit wrap */
-	a->step += adpcma_step_inc[nib & 7];
-	if (a->step < 0) a->step = 0; else if (a->step > 48) a->step = 48;
-	return 1;
-}
 
 static void adpcma_keyon(int ch)
 {
 	adpcma_t *a = &adpcma[ch];
 	a->pos  = (uint32_t)a->start_reg << 8;
 	a->end  = ((uint32_t)a->end_reg + 1) << 8;
-	a->hi = 1; a->acc = 0; a->step = 0;
-	a->s0 = a->s1 = 0; a->frac = 0;
+	a->hi = 1; a->frac = 0;
+	adpcma_rsp.ch[ch].acc = 0; adpcma_rsp.ch[ch].step = 0;
+	adpcma_rsp.ch[ch].s0 = adpcma_rsp.ch[ch].s1 = 0;
 	a->chunk_base = ~(uint32_t)0;
 	a->on = 1;
 	stat_adpcma_keyons++;
@@ -1060,65 +1030,99 @@ static void adpcma_write(uint8_t addr, uint8_t val)
 	}
 }
 
-/* Add n output samples of all ADPCM-A channels into out (L) / outR (R).
- * Each channel accumulates into one of three sums chosen by its pan bits
- * (centre, left only, right only), so the inner loop does a single store. */
-static void adpcma_render(int32_t *out, int32_t *outR, int n)
+/* ---- ADPCM-A rendering (on the RSP, see rsp_fm.h) ----
+ *
+ * The decoder state (acc, step, s0, s1) lives in adpcma_rsp, which the RSP
+ * reads and writes back every chunk.  The CPU keeps the addresses: ADPCM-A
+ * runs slower than the output rate, so a chunk decodes exactly
+ * (frac + n*RATE) >> 16 nibbles, and where the sample ends follows from the
+ * addresses alone. */
+
+/* Prepare one chunk of n samples: per channel, how many samples to produce,
+ * its volume and pan, and the bytes it will decode.  Returns nonzero when
+ * some channel is audible. */
+static int adpcma_stage(int n)
 {
-	static int32_t accs[3][1024];          /* 0: L+R, 1: L only, 2: R only */
-	int used = 0, any = 0;
+	int any = 0;
 	for (int c = 0; c < 6; c++) {
 		adpcma_t *a = &adpcma[c];
-		if (!a->on) continue;
+		struct rsp_adpcma_chan *ch = &adpcma_rsp.ch[c];
+		if (!a->on) { ch->nsamp = 0; continue; }
 		int vol = ((a->level ^ 0x1F) & 0x1F) + ((adpcma_total ^ 0x3F) & 0x3F);
 		int audible = vol < 63 && (a->pan & 0xC0);
-		int mul = 15 - (vol & 7), sh = 5 + (vol >> 3);
-		int k = (a->pan & 0xC0) == 0xC0 ? 0 : (a->pan & 0x80) ? 1 : 2;
-		int32_t *acc = accs[k];
-		if (audible && !(used & (1 << k))) { memset(acc, 0, n * sizeof(int32_t)); used |= 1 << k; }
-		/* locals: the int32 stores into acc would otherwise force reloads */
-		uint32_t frac = a->frac; int32_t s0 = a->s0, s1 = a->s1;
-		for (int i = 0; i < n; i++) {
+		ch->out = audible ? (((a->pan >> 7) & 1) | (((a->pan >> 6) & 1) << 1)) : 0;
+		ch->mul = (uint8_t)(15 - (vol & 7));
+		ch->sh = (uint8_t)(5 + (vol >> 3));
+
+		uint32_t frac = a->frac;
+		uint32_t dec = (frac + (uint32_t)n * ADPCMA_RATE_Q16) >> 16;   /* nibbles this chunk */
+		int k0 = a->hi ? 0 : 1;                                       /* low nibble of a held byte first? */
+		/* nibbles left before the end address (checked before each new byte) */
+		uint32_t avail = 2 * ((a->end - a->pos) & 0xFFFFF) + (uint32_t)k0;
+		int ns = n;
+		if (dec > avail) {
+			/* decode number avail+1 fails: the channel stops at that sample */
+			ns = (int)(((((avail + 1) << 16) - frac) + ADPCMA_RATE_Q16 - 1) / ADPCMA_RATE_Q16) - 1;
+			dec = avail;
+			a->on = 0;
+			ym_adpcm_status |= (uint8_t)(1 << c);  /* end-of-sample flag */
+			stat_adpcma_ends++;
+		}
+		ch->nsamp = (uint16_t)ns; ch->k0 = (uint8_t)k0; ch->frac = (uint16_t)frac;
+		if (ns && ch->out) any = 1;
+
+		/* stage the bytes holding nibbles k0 .. k0+dec-1 */
+		uint8_t *b = adpcma_rsp.bytes[c];
+		uint32_t base = a->pos - (uint32_t)k0;     /* address of b[0] */
+		uint32_t t = (uint32_t)k0 + dec, nb = (t + 1) >> 1;
+		if (k0) b[0] = a->byte;
+		for (uint32_t j = (uint32_t)k0; j < nb; j++) b[j] = (uint8_t)adpcma_fetch(c, base + j);
+		/* where the next chunk starts */
+		if (t & 1) { a->hi = 0; a->byte = b[t >> 1]; a->pos = base + (t >> 1) + 1; }
+		else       { a->hi = 1; a->pos = base + (t >> 1); }
+		a->frac = (frac + (uint32_t)ns * ADPCMA_RATE_Q16) & 0xFFFF;
+	}
+	return any;
+}
+
+/* C model of cmd_adpcma_render in rsp_fm.S, operation for operation: used
+ * by the host build and to check the RSP (-DADPCMA_VERIFY). */
+static void adpcma_model(struct rsp_adpcma_state *st, int n, int32_t *out)
+{
+	memset(out, 0, (size_t)n * 2 * sizeof(int32_t));
+	for (int c = 0; c < 6; c++) {
+		struct rsp_adpcma_chan *ch = &st->ch[c];
+		int ns = ch->nsamp;
+		if (!ns) continue;
+		int32_t acc = ch->acc, step = ch->step, s0 = ch->s0, s1 = ch->s1;
+		uint32_t frac = ch->frac; int k = ch->k0;
+		const uint8_t *b = st->bytes[c];
+		for (int i = 0; i < ns; i++) {
 			frac += ADPCMA_RATE_Q16;
-			while (frac >= 65536) {
+			if (frac >= 65536) {
 				frac -= 65536;
 				s0 = s1;
-				if (!adpcma_decode(c)) {                    /* reached the end address */
-					a->on = 0;
-					ym_adpcm_status |= (uint8_t)(1 << c);  /* end-of-sample flag */
-					stat_adpcma_ends++;
-					break;
-				}
-				s1 = (a->acc ^ 0x800) - 0x800;           /* sign-extend 12 bits */
+				int byte = b[k >> 1];
+				int nib = (k & 1) ? (byte & 15) : (byte >> 4);
+				k++;
+				int m = nib & 7, d = adpcma_steps[step];
+				int p = d + ((m & 1) ? d << 1 : 0) + ((m & 2) ? d << 2 : 0) + ((m & 4) ? d << 3 : 0);
+				p >>= 3;
+				if (nib & 8) p = -p;
+				acc = (acc + p) & 0xFFF;
+				step += adpcma_step_inc[m];
+				step = step < 0 ? 0 : step > 48 ? 48 : step;
+				s1 = (acc ^ 0x800) - 0x800;
 			}
-			if (!a->on) break;
-			if (!audible) continue;
-			/* |s1-s0| < 4096 and frac < 65536: the product fits in 32 bits */
-			int32_t v = s0 + (((s1 - s0) * (int32_t)frac) >> 16);
-			int32_t smp = (((v << 4) * mul) >> sh) & ~3;
-			acc[i] += smp;
-			any |= smp;
+			if (ch->out) {
+				int32_t v = s0 + (((s1 - s0) * (int32_t)frac) >> 16);
+				int32_t smp = (((v << 4) * ch->mul) >> ch->sh) & ~3;
+				if (ch->out & 1) out[2 * i] += smp;
+				if (ch->out & 2) out[2 * i + 1] += smp;
+			}
 		}
-		a->frac = frac; a->s0 = s0; a->s1 = s1;
-	}
-	if (!any) return;
-	stat_adpcma_nonzero += n;
-	/* gain on the channel sum (left = centre + left-only, right likewise) */
-	if (used == 1) {
-		int32_t *C = accs[0];
-		for (int i = 0; i < n; i++) {
-			int32_t v = C[i] >> ADPCMA_GAIN_SHIFT;
-			int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m;
-			out[i] += v; outR[i] += v;
-		}
-	} else {
-		for (int k = 0; k < 3; k++) if (!(used & (1 << k))) memset(accs[k], 0, n * sizeof(int32_t));
-		for (int i = 0; i < n; i++) {
-			int32_t v = (accs[0][i] + accs[1][i]) >> ADPCMA_GAIN_SHIFT;
-			int32_t w = (accs[0][i] + accs[2][i]) >> ADPCMA_GAIN_SHIFT;
-			int32_t m = v < 0 ? -v : v; if (m > pk_a) pk_a = m;
-			out[i] += v; outR[i] += w;
-		}
+		ch->acc = (int16_t)acc; ch->step = (int16_t)step; ch->s0 = (int16_t)s0; ch->s1 = (int16_t)s1;
+		ch->frac = (uint16_t)frac;
 	}
 }
 
@@ -1442,7 +1446,7 @@ void sound_init(const uint8_t *rom, int rom_size)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
 	for (int c = 0; c < 4; c++) { ym_ch[c].pan = 0xC0; fm_state.ch[c].pan = 0xC0; }
 	eg_acc = 0; eg_cnt = 1;
-	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F; adpcma_build_tables();
+	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F; memset(&adpcma_rsp, 0, sizeof(adpcma_rsp));
 	memset(adpcmb_reg, 0, sizeof(adpcmb_reg)); adpcmb_reset(); adpcmb_clk_acc = 0; ym_flag_mask = 0xBF;
 	for (int c = 0; c < 6; c++) { adpcma[c].level = 0x1F; adpcma[c].pan = 0xC0; }
 	memset(ssg_reg, 0, sizeof(ssg_reg)); memset(ssg_cnt, 0, sizeof(ssg_cnt)); memset(ssg_tone, 0, sizeof(ssg_tone));
@@ -1892,38 +1896,67 @@ static int render_segment(int16_t *buf, int max_samples)
 #endif
 		int32_t *fm = fm_output + 2 * off, *ml = mix, *mr = mixR;
 #ifdef N64
-		fm_state.num_samples = n;
-		rsp_fm_render(&fm_state, fm);            /* asynchronous */
-		memset(ml, 0, n * sizeof(int32_t)); memset(mr, 0, n * sizeof(int32_t));
 		uint32_t q0 = TICKS_READ();
-		ssg_render(ml, mr, n);
+		int aany = adpcma_stage(n);
+#ifdef ADPCMA_VERIFY
+		static struct rsp_adpcma_state vcopy; memcpy(&vcopy, &adpcma_rsp, sizeof(vcopy));
+#endif
 		uint32_t q1 = TICKS_READ();
-		adpcma_render(ml, mr, n);
+		fm_state.num_samples = n;
+		rsp_fm_render(&fm_state, fm);            /* asynchronous: FM ... */
+		rsp_adpcma_render(&adpcma_rsp, n, adpcma_out);   /* ... and ADPCM-A */
+		memset(ml, 0, n * sizeof(int32_t)); memset(mr, 0, n * sizeof(int32_t));
 		uint32_t q2 = TICKS_READ();
-		adpcmb_render(ml, mr, n);
+		ssg_render(ml, mr, n);
 		uint32_t q3 = TICKS_READ();
-		prof_ssg += TICKS_DISTANCE(q0, q1); prof_a += TICKS_DISTANCE(q1, q2); prof_b += TICKS_DISTANCE(q2, q3);
-		rsp_fm_wait();   /* state and output were written by RSP DMA; rsp_fm_render dropped our cached copies */
-		t_wait += TICKS_DISTANCE(q3, TICKS_READ());
+		adpcmb_render(ml, mr, n);
+		uint32_t q4 = TICKS_READ();
+		prof_a += TICKS_DISTANCE(q0, q1); prof_ssg += TICKS_DISTANCE(q2, q3); prof_b += TICKS_DISTANCE(q3, q4);
+		rsp_fm_wait();   /* state and output were written by RSP DMA; the submits dropped our cached copies */
+		t_wait += TICKS_DISTANCE(q4, TICKS_READ());
+#ifdef ADPCMA_VERIFY
+		{
+			/* the RSP must match the C model bit for bit */
+			static int32_t ref[2 * 128]; static uint32_t chunks, bad;
+			adpcma_model(&vcopy, n, ref);
+			int diff = memcmp(ref, adpcma_out, (size_t)n * 8) != 0 || memcmp(&vcopy.ch, &adpcma_rsp.ch, sizeof(vcopy.ch)) != 0;
+			chunks++;
+			if (diff && bad++ < 10) {
+				int i = 0; while (i < 2 * n && ref[i] == adpcma_out[i]) i++;
+				debugf("[AVERIFY] chunk %lu n=%d: first output diff at %d (model %ld, rsp %ld)\n", (unsigned long)chunks, n, i,
+					(long)(i < 2 * n ? ref[i] : 0), (long)(i < 2 * n ? adpcma_out[i] : 0));
+				for (int ch = 0; ch < 6; ch++) if (memcmp(&vcopy.ch[ch], &adpcma_rsp.ch[ch], 16))
+					debugf("[AVERIFY]   ch%d model acc=%d step=%d s0=%d s1=%d frac=%u | rsp acc=%d step=%d s0=%d s1=%d frac=%u\n", ch,
+						vcopy.ch[ch].acc, vcopy.ch[ch].step, vcopy.ch[ch].s0, vcopy.ch[ch].s1, vcopy.ch[ch].frac,
+						adpcma_rsp.ch[ch].acc, adpcma_rsp.ch[ch].step, adpcma_rsp.ch[ch].s0, adpcma_rsp.ch[ch].s1, adpcma_rsp.ch[ch].frac);
+			}
+			if ((chunks & 2047) == 0) debugf("[AVERIFY] %lu chunks, %lu mismatched\n", (unsigned long)chunks, (unsigned long)bad);
+		}
+#endif
 #else
 		memset(fm, 0, n * 2 * sizeof(int32_t));   /* host builds: FM is checked via the C model */
 		memset(ml, 0, n * sizeof(int32_t)); memset(mr, 0, n * sizeof(int32_t));
 		/* host tests: snd_host_mute bit0 SSG, bit1 ADPCM (A+B); a muted source
 		 * still runs, into a scratch buffer */
 		static int32_t scr[EG_CHUNK], scrR[EG_CHUNK];
+		int aany = adpcma_stage(n);
+		adpcma_model(&adpcma_rsp, n, adpcma_out);
+		if (snd_host_mute & 2) { aany = 0; memset(adpcma_out, 0, (size_t)n * 8); }
 		ssg_render((snd_host_mute & 1) ? scr : ml, (snd_host_mute & 1) ? scrR : mr, n);
-		adpcma_render((snd_host_mute & 2) ? scr : ml, (snd_host_mute & 2) ? scrR : mr, n);
 		adpcmb_render((snd_host_mute & 2) ? scr : ml, (snd_host_mute & 2) ? scrR : mr, n);
 #endif
+		if (aany) stat_adpcma_nonzero += n;
 		/* add the FM, clamp, store; peaks via max/min (no per-sample abs) */
 		{
-			int32_t fhi = 0, flo = 0, ohi = 0, olo = 0; uint32_t clip = 0, nz = 0;
+			int32_t fhi = 0, flo = 0, ohi = 0, olo = 0, ahi = 0, alo = 0; uint32_t clip = 0, nz = 0;
 			int16_t *dst = buf + 2 * off;
 			for (int i = 0; i < n; i++) {
 				int32_t fl = fm[2 * i] >> FM_MIX_SHIFT, fr = fm[2 * i + 1] >> FM_MIX_SHIFT;
 				fhi = fl > fhi ? fl : fhi; flo = fl < flo ? fl : flo;
 				fhi = fr > fhi ? fr : fhi; flo = fr < flo ? fr : flo;
-				int32_t l = ml[i] + fl, r = mr[i] + fr;
+				int32_t al = adpcma_out[2 * i] >> ADPCMA_GAIN_SHIFT, ar = adpcma_out[2 * i + 1] >> ADPCMA_GAIN_SHIFT;
+				ahi = al > ahi ? al : ahi; alo = al < alo ? al : alo;
+				int32_t l = ml[i] + fl + al, r = mr[i] + fr + ar;
 				if (l > 32767) { l = 32767; clip++; } else if (l < -32768) { l = -32768; clip++; }
 				if (r > 32767) { r = 32767; clip++; } else if (r < -32768) { r = -32768; clip++; }
 				nz += (l | r) != 0;
@@ -1934,6 +1967,7 @@ static int render_segment(int16_t *buf, int max_samples)
 			pk_fm = fhi > pk_fm ? fhi : pk_fm; pk_fm = -flo > pk_fm ? -flo : pk_fm;
 			stat_peak = ohi > stat_peak ? ohi : stat_peak; stat_peak = -olo > stat_peak ? -olo : stat_peak;
 			stat_clipped += clip; stat_nonzero += nz;
+			pk_a = ahi > pk_a ? ahi : pk_a; pk_a = -alo > pk_a ? -alo : pk_a;
 		}
 		off += n;
 	}

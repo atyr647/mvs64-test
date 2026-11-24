@@ -31,6 +31,7 @@ static uint16_t rsp_exp_tab[256] __attribute__((aligned(16)));
 enum {
 	CMD_FM_RENDER = 0,
 	CMD_FM_INIT_TABLES = 1,
+	CMD_ADPCMA_RENDER = 2,
 };
 
 void rsp_fm_init(void)
@@ -101,7 +102,8 @@ static void upload_tables(void)
 
 static rspq_syncpoint_t fm_sync;
 
-/* Queue one FM render and return at once; rsp_fm_wait() blocks until the RSP
+/* Queue one FM render and return at once (rsp_adpcma_render queues the
+ * ADPCM-A part and the syncpoint); rsp_fm_wait() blocks until the RSP
  * has written the state and the samples back.
  *
  * The syncpoint is queued in the same batch as the render.  (Appending it
@@ -128,6 +130,19 @@ void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf)
 		   state->num_samples,
 		   PhysicalAddr(state),
 		   PhysicalAddr(out_buf));
+}
+
+/* Queue ADPCM-A for the chunk just queued by rsp_fm_render, then the
+ * syncpoint that rsp_fm_wait() waits for (one wait covers both). */
+void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf)
+{
+	data_cache_hit_writeback_invalidate(state, (sizeof(*state) + 15) & ~15);
+	{
+		uintptr_t a = (uintptr_t)out_buf & ~(uintptr_t)15;
+		uintptr_t b = ((uintptr_t)(out_buf + 2 * n) + 15) & ~(uintptr_t)15;
+		data_cache_hit_invalidate((void *)a, b - a);
+	}
+	rspq_write(fm_ovl_id, CMD_ADPCMA_RENDER, n, PhysicalAddr(state), PhysicalAddr(out_buf));
 	fm_sync = rspq_syncpoint_new();
 	rspq_flush();
 }
@@ -139,4 +154,5 @@ void rsp_fm_wait(void)
 #else
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf) {}
 void rsp_fm_wait(void) {}
+void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf) {}
 #endif

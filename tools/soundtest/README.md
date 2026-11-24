@@ -74,6 +74,16 @@ reports as dropouts.
 Env: `BIOS` (NeoGeo BIOS; `sfix.sfix` beside it), `N64_INST`, `ARES`
 (default `/opt/pak-ares/bin/ares`), `GAME_ZIP`, `AUTOPLAY_SECONDS`.
 
+## ADPCM-A on the RSP
+
+ADPCM-A is decoded on the RSP (`cmd_adpcma_render` in `rsp_fm.S`). The CPU
+stages each chunk's bytes and end handling (`adpcma_stage`), and
+`adpcma_model` in `ym2610_intf.c` is a C model of the RSP routine. Host builds
+run the model, so the host suite checks it against ymfm and the old
+decoder's output. `SND_CFLAGS=-DADPCMA_VERIFY` runs the model next to the RSP
+on the N64 and logs `[AVERIFY] <chunks>, <n> mismatched` (outputs and state
+must match bit for bit; 0 mismatches over 40,960 gameplay chunks in ares).
+
 ## Other switches
 
 * `SND_CFLAGS=-DSND_DISABLE` turns the sound CPU off, for A/B performance runs.

@@ -49,6 +49,29 @@ struct rsp_fm_state {
 }; /* 232 bytes */
 
 void rsp_fm_init(void);
+/* ---- ADPCM-A on the RSP ----
+ * The CPU keeps the register state, addresses and end-of-sample handling;
+ * per render chunk it stages each channel's compressed bytes and says how
+ * many samples to produce.  The RSP decodes, resamples (18.5 kHz -> 22.05
+ * kHz, linear) and applies the volume, writing the per-sample L and R sums
+ * (int32, before the x0.5 gain).  Layout is shared with rsp_fm.S. */
+#define RSP_ADPCMA_BYTES 48           /* staged bytes per channel per chunk (<= 92 samples) */
+struct rsp_adpcma_chan {
+	int16_t  acc;      /* 12-bit decoder accumulator, 0..4095 */
+	int16_t  step;     /* step index 0..48 */
+	int16_t  s0, s1;   /* last two decoded samples (sign-extended) */
+	uint16_t frac;     /* resampling phase (Q16) */
+	uint16_t nsamp;    /* samples to produce this chunk (0 = channel idle) */
+	uint8_t  k0;       /* first nibble: 0 = high nibble of bytes[0], 1 = low */
+	uint8_t  out;      /* bit0 add to L, bit1 add to R (0 = decode only) */
+	uint8_t  mul;      /* volume multiplier 8..15 */
+	uint8_t  sh;       /* volume shift 5..12 */
+} __attribute__((packed));            /* 16 bytes */
+struct rsp_adpcma_state {
+	struct rsp_adpcma_chan ch[6];                 /*  96 bytes */
+	uint8_t bytes[6][RSP_ADPCMA_BYTES];           /* 288 bytes */
+};                                                /* 384 bytes */
+
 /* The RSP runs FM_OVERSAMPLE operator steps per output sample (incr[] is
  * per step) and sums them into the output, which removes most of the
  * aliasing of bright FM patches at 22050 Hz. rsp_fm.S hardcodes 2. */
@@ -56,6 +79,8 @@ void rsp_fm_init(void);
 
 /* Renders state->num_samples (<= 128) stereo samples, int32 L,R interleaved. */
 void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);   /* asynchronous */
+/* queue ADPCM-A for the same chunk (call right after rsp_fm_render) */
+void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf);
 void rsp_fm_wait(void);                                              /* until that render is done */
 
 #endif

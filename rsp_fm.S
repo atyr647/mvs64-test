@@ -5,6 +5,7 @@
     RSPQ_BeginOverlayHeader
         RSPQ_DefineCommand cmd_fm_render, 12
         RSPQ_DefineCommand cmd_fm_init_tables, 12
+        RSPQ_DefineCommand cmd_adpcma_render, 12
     RSPQ_EndOverlayHeader
 
     RSPQ_BeginSavedState
@@ -13,7 +14,18 @@ sin_tab:    .space 512       /* 256 x uint16_t */
 exp_tab:    .space 512       /* 256 x uint16_t */
     RSPQ_EndSavedState
 
+    /* ADPCM-A step sizes and step index changes (ymfm / YM2610) */
+    .align 1
+adpcma_steps:
+    .half 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157
+    .half 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552
+adpcma_inc:
+    .byte -1, -1, -1, -1, 2, 5, 7, 9
+
     .bss
+    .align 3
+adpcma_state: .space 384      /* struct rsp_adpcma_state: 6 x 16 bytes of state, 6 x 48 staged bytes */
+rdram_astate: .space 4
     .align 3
 chan_state:  .space 232       /* YM2610: 4 channels * 56 + 8 header; multiple of 8 so work_out stays DMA-aligned */
 work_out:   .space 1024      /* up to 128 stereo samples: int32 L,R interleaved */
@@ -434,5 +446,190 @@ chan_next:
     jal     DMAOut
     nop
 
+    jr      v0
+    nop
+
+    ##############################################
+    # cmd_adpcma_render: ADPCM-A decode + resample + volume, 6 channels
+    #
+    # a0[15:0] = num_samples (<= 128), a1 = PhysicalAddr(struct rsp_adpcma_state),
+    # a2 = PhysicalAddr(out): int32 L,R sums per sample.
+    # Mirrors adpcma_model() in sound/ym2610_intf.c operation for operation.
+    #
+    #   v0 = saved ra      v1 = channel state     fp = channel's staged bytes
+    #   s7 = channels left k1 = num_samples       k0 = output pointer
+    #   t9 = samples left  s1 = acc  s2 = step  s3 = s0  s5 = s1  s6 = frac
+    #   a3 = nibble index  a0 = out flags  a1 = mul  a2 = sh  s4 = rate
+    ##############################################
+cmd_adpcma_render:
+    move    v0, ra
+    sw      a1, %lo(rdram_astate)
+    sw      a2, %lo(rdram_out)
+    andi    k1, a0, 0xFFFF
+
+    move    s0, a1
+    li      s4, %lo(adpcma_state)
+    li      t0, DMA_SIZE(384, 1)
+    jal     DMAIn
+    nop
+
+    li      t3, %lo(work_out)
+    sll     t4, k1, 3
+    add     t5, t3, t4
+a_clear:
+    sw      zero, 0(t3)
+    addiu   t3, t3, 4
+    bne     t3, t5, a_clear
+    nop
+
+    li      v1, %lo(adpcma_state)
+    li      fp, %lo(adpcma_state) + 96
+    li      s7, 6
+a_chan:
+    lhu     t9, 10(v1)              /* nsamp */
+    beqz    t9, a_chan_next
+    nop
+    lh      s1, 0(v1)               /* acc */
+    lh      s2, 2(v1)               /* step */
+    lh      s3, 4(v1)               /* s0 */
+    lh      s5, 6(v1)               /* s1 */
+    lhu     s6, 8(v1)               /* frac */
+    lbu     a3, 12(v1)              /* first nibble index */
+    lbu     a0, 13(v1)              /* out flags */
+    lbu     a1, 14(v1)              /* mul */
+    lbu     a2, 15(v1)              /* sh */
+    li      k0, %lo(work_out)
+    li      s4, 55042               /* ADPCMA_RATE_Q16 */
+
+a_samp:
+    addu    s6, s6, s4
+    srl     t0, s6, 16
+    beqz    t0, a_nodec
+    nop
+    /* ---- decode one nibble ---- */
+    andi    s6, s6, 0xFFFF
+    move    s3, s5                  /* s0 = s1 */
+    srl     t0, a3, 1
+    addu    t0, fp, t0
+    lbu     t1, 0(t0)
+    andi    t2, a3, 1
+    bnez    t2, a_lownib
+    andi    t3, t1, 15              /* (delay slot) low nibble */
+    srl     t3, t1, 4               /* high nibble */
+a_lownib:
+    addiu   a3, a3, 1
+    sll     t0, s2, 1
+    lhu     t4, %lo(adpcma_steps)(t0)   /* d */
+    andi    t5, t3, 7               /* m */
+    move    t6, t4                  /* p = d */
+    andi    t7, t5, 1
+    beqz    t7, a_m1
+    sll     t8, t4, 1
+    addu    t6, t6, t8
+a_m1:
+    andi    t7, t5, 2
+    beqz    t7, a_m2
+    sll     t8, t4, 2
+    addu    t6, t6, t8
+a_m2:
+    andi    t7, t5, 4
+    beqz    t7, a_m4
+    sll     t8, t4, 3
+    addu    t6, t6, t8
+a_m4:
+    srl     t6, t6, 3
+    andi    t7, t3, 8
+    beqz    t7, a_pos
+    nop
+    subu    t6, zero, t6
+a_pos:
+    addu    s1, s1, t6
+    andi    s1, s1, 0xFFF
+    lb      t7, %lo(adpcma_inc)(t5)
+    addu    s2, s2, t7
+    bgez    s2, a_s0
+    nop
+    move    s2, zero
+a_s0:
+    slti    t7, s2, 49
+    bnez    t7, a_s48
+    nop
+    li      s2, 48
+a_s48:
+    xori    t7, s1, 0x800
+    addiu   s5, t7, -0x800          /* s1 = sign-extended acc */
+a_nodec:
+    beqz    a0, a_samp_next
+    nop
+    /* ---- v = s0 + ((s1 - s0) * frac) >> 16 (signed x unsigned, high half) ---- */
+    subu    t0, s5, s3
+    mtc2    t0, $v04.e0
+    mtc2    s6, $v05.e0
+    vmudm   $v06, $v04, $v05.e0
+    mfc2    t1, $v06.e0
+    addu    t1, s3, t1
+    sll     t1, t1, 4               /* x = v << 4 */
+    /* ---- p = x * mul (mul = 8..15) >> sh, & ~3 ---- */
+    addiu   t2, a1, -8
+    sll     t3, t1, 3
+    andi    t4, t2, 1
+    beqz    t4, a_v1
+    nop
+    addu    t3, t3, t1
+a_v1:
+    andi    t4, t2, 2
+    beqz    t4, a_v2
+    sll     t5, t1, 1
+    addu    t3, t3, t5
+a_v2:
+    andi    t4, t2, 4
+    beqz    t4, a_v4
+    sll     t5, t1, 2
+    addu    t3, t3, t5
+a_v4:
+    srav    t3, t3, a2
+    li      t4, -4
+    and     t3, t3, t4
+    andi    t4, a0, 1
+    beqz    t4, a_noL
+    nop
+    lw      t5, 0(k0)
+    addu    t5, t5, t3
+    sw      t5, 0(k0)
+a_noL:
+    andi    t4, a0, 2
+    beqz    t4, a_samp_next
+    nop
+    lw      t5, 4(k0)
+    addu    t5, t5, t3
+    sw      t5, 4(k0)
+a_samp_next:
+    addiu   t9, t9, -1
+    bnez    t9, a_samp
+    addiu   k0, k0, 8               /* (delay slot) */
+
+    sh      s1, 0(v1)
+    sh      s2, 2(v1)
+    sh      s3, 4(v1)
+    sh      s5, 6(v1)
+    sh      s6, 8(v1)
+a_chan_next:
+    addiu   v1, v1, 16
+    addiu   s7, s7, -1
+    bnez    s7, a_chan
+    addiu   fp, fp, 48              /* (delay slot) */
+
+    /* state back (the staged bytes are not changed) */
+    lw      s0, %lo(rdram_astate)
+    li      s4, %lo(adpcma_state)
+    li      t0, DMA_SIZE(96, 1)
+    jal     DMAOut
+    nop
+    lw      s0, %lo(rdram_out)
+    li      s4, %lo(work_out)
+    sll     t0, k1, 3
+    addiu   t0, t0, -1
+    jal     DMAOut
+    nop
     jr      v0
     nop
