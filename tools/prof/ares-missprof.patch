@@ -1,8 +1,8 @@
 diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
-index b51000d..8924933 100644
+index b51000d..9ddaaa3 100644
 --- a/ares/n64/cpu/cpu.hpp
 +++ b/ares/n64/cpu/cpu.hpp
-@@ -1,5 +1,34 @@
+@@ -1,5 +1,42 @@
  //NEC VR4300
  
 +// --- miss profiler (local patch): which code/data causes cache misses ---
@@ -16,6 +16,14 @@ index b51000d..8924933 100644
 +  std::unordered_map<u32,u32> icLine, dcPc, dcAddr;
 +  std::unordered_map<u64,u32> dcPair;
 +  void reset() { icLine.clear(); dcPc.clear(); dcAddr.clear(); dcPair.clear(); on = true; }
++  // MISSPROF_START / MISSPROF_END (CPU clocks): profile a fixed window without ROM support
++  s64 winStart = -1, winEnd = -1; bool winDone = false;
++  void tick(s64 clk) {
++    if (winStart < 0) { const char* a = getenv("MISSPROF_START"); const char* b = getenv("MISSPROF_END");
++      winStart = a ? atoll(a) : 0x7fffffffffffffffLL; winEnd = b ? atoll(b) : 0x7fffffffffffffffLL; }
++    if (!winDone && !on && clk >= winStart && clk < winEnd) reset();
++    if (on && clk >= winEnd && !winDone) { winDone = true; dump(); }
++  }
 +  void dump() {
 +    on = false;
 +    const char* path = getenv("MISSPROF_OUT"); if(!path) path = "missprof.txt";
@@ -37,10 +45,11 @@ index b51000d..8924933 100644
  struct CPU : Thread {
    Node::Object node;
  
-@@ -208,6 +237,7 @@ struct CPU : Thread {
+@@ -208,6 +245,8 @@ struct CPU : Thread {
        auto fill(u32 paddr, CPU& cpu) -> void {
          cpu.step(48 * 2);
          const u32 tag = paddr & ~0x0000'0fffu;
++        missProf.tick(cpu.profile.cpuCycles);
 +        if(missProf.on) missProf.icLine[0x8000'0000u | tag | index]++;
          tagKey = tag;
          setValid(true);

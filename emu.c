@@ -341,6 +341,14 @@ int main(int argc, char *argv[]) {
 		#endif
 
 		if (!plat_poll()) break;
+		#ifdef PROFILER_MISS
+		/* Patched ares only (tools/prof/ares-missprof.patch): histogram of the
+		 * code lines and data that miss the caches over frames 1500-3000,
+		 * written to $MISSPROF_OUT.  Independent of -DPROFILER, so it can be
+		 * used on a production layout. */
+		if (g_frame == 1500) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
+		if (g_frame == 3000) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
+		#endif
 		#ifdef PROFILER
 		#ifdef PROFILER_SAMPLE
 		{ extern void prof_frame(int); prof_frame((int)g_frame); }
@@ -379,12 +387,6 @@ int main(int argc, char *argv[]) {
 			if (g_frame == XSUM_END) debugf("[XSUM] native cycles=%lu icache_miss=%lu dcache_miss=%lu calls=%lu\n",
 				(unsigned long)((xn_cyc - n0[0]) / (XSUM_END - XSUM_START)), (unsigned long)((xn_ic - n0[1]) / (XSUM_END - XSUM_START)),
 				(unsigned long)((xn_dc - n0[2]) / (XSUM_END - XSUM_START)), (unsigned long)((xn_calls - n0[3]) / (XSUM_END - XSUM_START)));
-			#endif
-			#ifdef PROFILER_MISS
-			/* patched ares only (tools/prof/ares-missprof.patch): histogram of the code
-			 * lines and data accesses that miss the caches, written to $MISSPROF_OUT */
-			if (g_frame == XSUM_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
-			if (g_frame == XSUM_END)   { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
 			#endif
 			{ static uint64_t r0, h0, c0;
 			  if (g_frame == XSUM_START) { r0 = xprof_read(0x200); h0 = xprof_read(0x201); c0 = xprof_read(0); }

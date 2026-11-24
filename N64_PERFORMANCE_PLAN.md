@@ -65,6 +65,17 @@ other way: +266 KB of code, 52.9 -> 46.5 FPS (frames 2400-4000).
 profile of the current build (most hot code now native) gave 44.7: no
 better than no layout, so the original list stays.
 
+**The 52.9 FPS layout is fragile.** Nearly every perturbation drops it to
+~44-46 FPS: the interpreter at -O3 (44.8) or -Os (44.7), a regenerated hot
+list (44.7), even adding a few instructions to `main` (45.3). Deliberate
+placement did not recover it: pinning the I/O path, the memory wrappers and
+the small native routines into the first 16 KB of the hot block (43.6), the
+sprite-list builder right after them (44.4), handlers before the native
+routines (45.6). A time-window miss profile (patched ares, no ROM changes)
+shows the good layout has only ~6% fewer I-cache misses per frame than a bad
+one, so most of the 18% is not I-cache misses alone. Treat any change that
+moves code as a possible +-15% performance change, and measure it.
+
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
 11% (before the inlining change; profiling builds no longer represent the
 production layout well, see tools/prof/README.md). 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter

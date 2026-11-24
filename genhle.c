@@ -381,7 +381,9 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 		// Lay the native functions out next to the interpreter's hot block
 		// (linker script: SORT(.text.m68k.*)), in command-line order.
 		static int func_rank = 0;
-		fprintf(out, "__attribute__((section(\".text.m68k.%04d\")))\n", 10 + func_rank++);
+		static int section_base = -1;
+		if (section_base < 0) section_base = getenv("HLE_SECTION_BASE") ? atoi(getenv("HLE_SECTION_BASE")) : 10;
+		fprintf(out, "__attribute__((section(\".text.m68k.%04d\")))\n", section_base + func_rank++);
 		fprintf(out, "uint32_t func_%08X(m68ki_cpu_core * restrict __m68ki_cpu, int * restrict __m68ki_remaining_cycles, uint32_t __entry_pc) {\n", pc);
 		if (is_run)
 			fprintf(out, "\tuint32_t __pc = __entry_pc;\n\tdo {\n");
