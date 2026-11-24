@@ -76,6 +76,21 @@ shows the good layout has only ~6% fewer I-cache misses per frame than a bad
 one, so most of the 18% is not I-cache misses alone. Treat any change that
 moves code as a possible +-15% performance change, and measure it.
 
+**More AOT functions for the heavy section did not help** (frames
+6000-9000, HEAD 40.7 FPS). The heavy-section profile's top interpreted
+region, 0x4f1e0-0x4f47f, is four small loops (4f238 4f260 4f288 4f2b0)
+that call 4f2d8 for each active entry.
+- 4f2d8 compiled changes the game state for good from frame 7500 (the
+  0x101000 page, not only the stack; same with -fno-strict-aliasing), so it
+  is out.
+- The loops plus 5eebc 5eb58 53698 keep the game state (only the stack page
+  differs, see the per-4 KB `[STATE]` slices) but measure 37.8 FPS.
+- The three alone, 38.2.
+- A control (71e0 added), 40.7: the loss is the compiled code itself.
+  Functions run a few times per frame are cold in the I-cache, while the
+  interpreter's handlers stay in the hot block. AOT pays only for code run
+  many times per frame, which the current list already covers.
+
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
 11% (before the inlining change; profiling builds no longer represent the
 production layout well, see tools/prof/README.md). 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter
