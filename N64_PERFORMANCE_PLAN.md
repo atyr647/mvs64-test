@@ -6,6 +6,39 @@ subsystem and roughly ordered by expected impact.
 
 ---
 
+## Round 2 (late November 2026, ares)
+
+| Change | Frame cost | Real FPS (production build, from 40 s) |
+|---|---|---|
+| Previous round | 139% | |
+| AOT lookup only after control flow, unrolled VRAM runs | 135% | |
+| ADPCM-A decoded on the RSP | 129% | ~43.7 |
+
+Measured and rejected:
+- **Audio on the RSP high-priority queue**: CPU frame cost 130% -> 129%, but
+  real FPS 43.7 -> 29.4 (audio jumps ahead of the video's RSP work and the
+  frames are presented later). The frame-cost metric does not count waits
+  for the display/RDP: always check real FPS too.
+- **SSG on the RSP** (bit-exact, verified): CPU mixing -4 points of real
+  time, but the CPU's wait for the RSP +7. The RSP is busy only ~20% of a
+  frame; work only helps there if it overlaps the CPU's, and each audio chunk
+  is a synchronous round trip. Moving more audio (SSG, ADPCM-B) needs the
+  RSP to run several chunks ahead: FM state split into CPU-owned parameters
+  and RSP-owned phases. Patch kept outside the tree.
+- **Rewriting SSG/ADPCM-B for fewer instructions on the CPU**: bit-exact,
+  -1.8 points of work, but sound's I-cache misses doubled: no net gain.
+- **A 46-entry AOT list from autopick.py**: slower (I-cache) and changed the
+  game state.
+- **Inlining hints for the 68K memory helpers**: no change.
+
+Also fixed: a 60 Hz frame limiter (light scenes ran at 86 FPS and lost sound
+commands), and the FM table upload's `rspq_wait()` (hung the RSP queue in
+ares about one boot in two; now a syncpoint queued with the command).
+
+Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
+11%. 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter
+spends ~270 clocks per interpreted instruction, mostly cache misses.
+
 ## Empirical Findings (November 2026, ares)
 
 Measured in ares with exact cycle and cache-miss counters (`tools/prof`),

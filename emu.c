@@ -386,6 +386,15 @@ int main(int argc, char *argv[]) {
 			if (g_frame == XSUM_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
 			if (g_frame == XSUM_END)   { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
 			#endif
+			{ static uint64_t r0, h0, c0;
+			  if (g_frame == XSUM_START) { r0 = xprof_read(0x200); h0 = xprof_read(0x201); c0 = xprof_read(0); }
+			  if (g_frame == XSUM_END) {
+				uint64_t r = xprof_read(0x200) - r0, h = xprof_read(0x201) - h0, cc = xprof_read(0) - c0;
+				debugf("[XSUM] rsp_busy=%lu rsp_halted=%lu cpu_clocks=%lu per frame\n", (unsigned long)((r - h) / (XSUM_END - XSUM_START)),
+					(unsigned long)(h / (XSUM_END - XSUM_START)), (unsigned long)(cc / (XSUM_END - XSUM_START))); } }
+			{ extern unsigned long prof_exec_calls; static unsigned long e0;
+			  if (g_frame == XSUM_START) e0 = prof_exec_calls;
+			  if (g_frame == XSUM_END) debugf("[XSUM] exec_calls=%lu per frame\n", (prof_exec_calls - e0) / (XSUM_END - XSUM_START)); }
 			if (g_frame == XSUM_START) { xs_68k = t68k; xs_snd = tsnd; xs_draw = tdraw; xs_all = tall; xs_insn = tinsn; prof_op_on = 1; }
 			if (g_frame == XSUM_END) {
 				int nf = XSUM_END - XSUM_START; prof_op_on = 0;

@@ -94,12 +94,17 @@ static void upload_tables(void)
 		   0,
 		   PhysicalAddr(rsp_sin_tab),
 		   PhysicalAddr(rsp_exp_tab));
+	/* The syncpoint is queued in the same batch: rspq_wait() here (a later
+	 * syncpoint) hung the RSP queue in ares about one boot in two. */
+	rspq_syncpoint_t s = rspq_syncpoint_new();
 	rspq_flush();
-	rspq_wait();
+	rspq_syncpoint_wait(s);
 
 	tables_uploaded = 1;
 }
 
+/* Not the high-priority queue: audio jumping ahead of the video's RSP work
+ * lowered the CPU's wait here but delayed frames (ares: 43.7 -> 29.4 FPS). */
 static rspq_syncpoint_t fm_sync;
 
 /* Queue one FM render and return at once (rsp_adpcma_render queues the

@@ -21,6 +21,14 @@ The extra flags perturb the caches (their tables are several KB), so take the
 `[XSUM]` numbers from a plain `-DPROFILER` build. A miss costs 96 clocks
 (I-cache) or 80 (D-cache) in ares; one emulated frame at 60 Hz is 1,562,500.
 
+`[XSUM]` counts the CPU's own work (68K, sound, draw). It does not count
+time spent waiting for the display, the RDP or the RSP outside the sound
+code, so a change that shifts work onto those can look faster there and
+still lower the frame rate: always confirm with the real FPS of a
+production build (`grep ^FPS`, mean from 40 s on). Moving the audio to the
+RSP high-priority queue measured 1.5% better in `[XSUM]` and 33% worse in
+FPS.
+
 `frametime.sh <log> [from to]` gives the mean frame cost from the `[PROFILE]`
 lines of any N64 build. `dasm68k.c` disassembles a range of the P-ROM
 (`gcc -I<stub dir> dasm68k.c m68kdasm.c`).

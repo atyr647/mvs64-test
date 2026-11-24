@@ -1006,8 +1006,14 @@ static inline void xn_end(void)   { xn_cyc += xn_read(0); xn_ic += xn_read(0x11)
 #ifdef USE_HLE
 int m68ki_hle_check = 1;
 #endif
+#ifdef PROFILER
+unsigned long prof_exec_calls;
+#endif
 M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 {
+#ifdef PROFILER
+	prof_exec_calls++;
+#endif
 #ifdef USE_HLE
 	if (!m68ki_hle_check) m68ki_hle_check = 1;   /* a new timeslice may start at an entrypoint */
 #endif
