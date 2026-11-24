@@ -81,8 +81,12 @@ moves code as a possible +-15% performance change, and measure it.
 region, 0x4f1e0-0x4f47f, is four small loops (4f238 4f260 4f288 4f2b0)
 that call 4f2d8 for each active entry.
 - 4f2d8 compiled changes the game state for good from frame 7500 (the
-  0x101000 page, not only the stack; same with -fno-strict-aliasing), so it
-  is out.
+  0x101000 page, not only the stack; same with -fno-strict-aliasing). It is
+  not miscompiled: a lockstep check (`-DHLE_VERIFY=0x4f2d8`, m68kcpu.c)
+  found registers, flags, cycles and work RAM identical to the interpreter
+  on every call. Native code tests the cycle budget only at backward
+  branches, so an interrupt can land up to one loop iteration later, and
+  here that changes the game's course. It is called rarely, so it stays out.
 - The loops plus 5eebc 5eb58 53698 keep the game state (only the stack page
   differs, see the per-4 KB `[STATE]` slices) but measure 37.8 FPS.
 - The three alone, 38.2.

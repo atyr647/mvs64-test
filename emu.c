@@ -343,11 +343,15 @@ int main(int argc, char *argv[]) {
 		if (!plat_poll()) break;
 		#ifdef PROFILER_MISS
 		/* Patched ares only (tools/prof/ares-missprof.patch): histogram of the
-		 * code lines and data that miss the caches over frames 1500-3000,
-		 * written to $MISSPROF_OUT.  Independent of -DPROFILER, so it can be
-		 * used on a production layout. */
-		if (g_frame == 1500) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
-		if (g_frame == 3000) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
+		 * code lines and data that miss the caches over frames MISS_START to
+		 * MISS_END (default 1500-3000), written to $MISSPROF_OUT.  Independent
+		 * of -DPROFILER, so it can be used on a production layout. */
+		#ifndef MISS_START
+		#define MISS_START 1500
+		#define MISS_END 3000
+		#endif
+		if (g_frame == MISS_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
+		if (g_frame == MISS_END) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
 		#endif
 		#ifdef PROFILER
 		#ifdef PROFILER_SAMPLE

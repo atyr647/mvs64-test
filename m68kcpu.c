@@ -1006,6 +1006,48 @@ static inline void xn_end(void)   { xn_cyc += xn_read(0); xn_ic += xn_read(0x11)
 #ifdef USE_HLE
 int m68ki_hle_check = 1;
 #endif
+#if defined(USE_HLE) && defined(HLE_VERIFY)
+/* -DHLE_VERIFY=0xPC: lockstep check of one AOT function. Each call runs the
+ * native code, then rewinds CPU and work RAM and interprets to the same end
+ * point (PC, SP and cycles), compares, and keeps the interpreter's result.
+ * Only valid for functions whose side effects outside work RAM are
+ * idempotent (no FIFO or VRAM writes). */
+#include <stdio.h>
+#include "hw.h"
+#include <debug.h>
+static uint8_t hv_ram0[0x10000], hv_ram1[0x10000];
+static unsigned long hv_calls, hv_bad;
+static void hle_verify_call(const HLEFunc *hle)
+{
+	m68ki_cpu_core c0 = m68ki_cpu, c1; sint cyc0 = GET_CYCLES(), cyc1;
+	memcpy(hv_ram0, WORK_RAM, sizeof hv_ram0);
+	REG_PPC = REG_PC;
+	REG_PC = hle->func(&m68ki_cpu, &m68ki_remaining_cycles, REG_PC);
+	c1 = m68ki_cpu; cyc1 = GET_CYCLES(); uint sr1 = m68ki_get_sr();
+	memcpy(hv_ram1, WORK_RAM, sizeof hv_ram1);
+	/* rewind and interpret */
+	m68ki_cpu = c0; SET_CYCLES(cyc0); memcpy(WORK_RAM, hv_ram0, sizeof hv_ram0);
+	int n = 0;
+	do {
+		REG_PPC = REG_PC; REG_IR = m68ki_read_imm_16();
+		m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF]();
+		n++;
+	} while (n < 100000 && !(REG_PC == c1.pc && REG_A[7] == c1.dar[15] && GET_CYCLES() <= cyc1));
+	hv_calls++;
+	int bad = REG_PC != c1.pc || GET_CYCLES() != cyc1 || m68ki_get_sr() != sr1;
+	for (int i = 0; i < 16; i++) bad |= REG_DA[i] != c1.dar[i];
+	int ram = memcmp(WORK_RAM, hv_ram1, sizeof hv_ram1) != 0; bad |= ram;
+	if (bad && hv_bad++ < 20) {
+		debugf("[HLEV] call %lu at %x: %d insns; pc %x/%x cyc %ld/%ld sr %x/%x\n", hv_calls, c0.pc, n,
+			REG_PC, c1.pc, (long)GET_CYCLES(), (long)cyc1, m68ki_get_sr(), sr1);
+		for (int i = 0; i < 16; i++) if (REG_DA[i] != c1.dar[i])
+			debugf("[HLEV]   %c%d interp %08x native %08x (start %08x)\n", i < 8 ? 'D' : 'A', i & 7, REG_DA[i], c1.dar[i], c0.dar[i]);
+		if (ram) for (int i = 0, k = 0; i < 0x10000 && k < 8; i++) if (WORK_RAM[i] != hv_ram1[i])
+			debugf("[HLEV]   ram %06x interp %02x native %02x (start %02x)\n", 0x100000 + i, WORK_RAM[i], hv_ram1[i], hv_ram0[i]), k++;
+	}
+	if (hv_calls % 2000 == 0) debugf("[HLEV] %lu calls, %lu bad\n", hv_calls, hv_bad);
+}
+#endif
 #ifdef PROFILER
 unsigned long prof_exec_calls;
 #endif
@@ -1072,6 +1114,9 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 				if (hle) {
 #ifdef PROFILER
 					prof_hle++;
+#endif
+#ifdef HLE_VERIFY
+					if (REG_PC == HLE_VERIFY) { hle_verify_call(hle); m68ki_hle_check = 8; continue; }
 #endif
 					REG_PPC = REG_PC;
 #ifdef PROFILER_NAT
