@@ -81,8 +81,8 @@ is 8 KB direct-mapped, and `m68ki_cpu`, the top-level opcode table and
 `m68ki_remaining_cycles` shifted with any change to static data. In one
 build the cycle counter shared a cache line with the CPU struct: 28 FPS
 from boot. They now live in one 8 KB-aligned block at a fixed cache offset
-(`m68ki_hot`, m68kcpu.h). Shifting all static data by 0x1a0 bytes now
-changes FPS by less than 0.2%.
+(`m68ki_hot`, m68kcpu.h). Shifting all static data by 0x1a0 or 0x8c0
+bytes now changes FPS by less than 0.4%.
 
 With music working in the whole run (frames 2400-4000 / 4000-6000 /
 6000-9000): 44.9 / 42.4 / 42.2 FPS before, 48.2 / 45.3 / 41.3 after.
