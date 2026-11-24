@@ -1519,8 +1519,19 @@ static inline void m68ki_fake_pull_32(void)
  * These functions will also call the pc_changed callback if it was enabled
  * in m68kconf.h.
  */
+/* Native (AOT) code is only looked up after a change of control flow: every
+ * jump, call, return and taken branch asks the dispatch loop to check the new
+ * PC (see m68k_execute). */
+#ifdef USE_HLE
+extern int m68ki_hle_check;
+#define M68K_HLE_FLOW() (m68ki_hle_check = 1)
+#else
+#define M68K_HLE_FLOW()
+#endif
+
 static inline void m68ki_jump(uint new_pc)
 {
+	M68K_HLE_FLOW();
 	REG_PC = new_pc;
 #if !(defined(N64) && defined(USE_TLB_FETCH))
 	m68ki_update_fetch_base();
@@ -1546,6 +1557,7 @@ static inline void m68ki_jump_vector(uint vector)
  */
 static inline void m68ki_branch_8(uint offset)
 {
+	M68K_HLE_FLOW();
 	REG_PC += MAKE_INT_8(offset);
 	if (m68k_check_idle_skip(REG_PC))
 		m68k_consume_timeslice();
@@ -1553,6 +1565,7 @@ static inline void m68ki_branch_8(uint offset)
 
 static inline void m68ki_branch_16(uint offset)
 {
+	M68K_HLE_FLOW();
 	REG_PC += MAKE_INT_16(offset);
 	if (m68k_check_idle_skip(REG_PC))
 		m68k_consume_timeslice();
@@ -1560,6 +1573,7 @@ static inline void m68ki_branch_16(uint offset)
 
 static inline void m68ki_branch_32(uint offset)
 {
+	M68K_HLE_FLOW();
 	REG_PC += offset;
 #if !(defined(N64) && defined(USE_TLB_FETCH))
 	m68ki_update_fetch_base();

@@ -60,10 +60,16 @@ ifdef USE_HLE
 #   collision detection               : 4f920
 #   task scheduler / yield            : 3820 3878 (re-entered at 3860)
 #   misc scans and text output        : 4f0c6 11e6 1160
+# tools/prof/autopick.py proposes a longer list from a profile; a 46-entry
+# list from it measured slower (I-cache) and changed the game state, so new
+# entries must be verified one by one with -DPROFILER_STATE.
 HLE_PCS = 4012 4096 41b8 4f920 3820 3878 4f0c6 11e6 1160
 # Extra entrypoints inside the functions above (see genhle.c, "@pc")
 HLE_ENTRIES = 3860
-HLE_GEN_C = $(patsubst %,hle_%.c,$(HLE_PCS)) hle_index.c
+# Unrolled runs (see genhle.c, "rPC"): the two VRAM upload tables, entered at a
+# computed offset, about 1200 instructions per frame in Stage 1.
+HLE_RUNS = 445c 5ae8
+HLE_GEN_C = $(patsubst %,hle_%.c,$(HLE_PCS) $(HLE_RUNS)) hle_index.c
 HLE_GEN_H = hle_index.h
 HLE_ALL   = $(HLE_GEN_C) $(HLE_GEN_H)
 CFLAGS += -DUSE_HLE
@@ -160,7 +166,7 @@ HLE_STAMP = $(BUILD_DIR)/.hle-stamp
 # we only regen when the BIOS/ROM, m68kops.c, or the HLE_PCS list changes.
 $(HLE_STAMP): $(MVS_STAMP) m68kops.c Makefile.mvs64 | genhle
 	@echo "    [HLE] generating $(words $(HLE_PCS)) function(s) from $(ROMDIR)"
-	./genhle $(ROMDIR)/p.rom $(addprefix @,$(HLE_ENTRIES)) $(HLE_PCS) $(ROMDIR)/p.bios@c00000
+	./genhle $(ROMDIR)/p.rom $(ROMDIR)/p.bios@c00000 $(addprefix @,$(HLE_ENTRIES)) $(HLE_PCS) $(addprefix r,$(HLE_RUNS))
 	@mkdir -p $(dir $@)
 	@touch $@
 

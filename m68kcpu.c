@@ -973,6 +973,9 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 #ifdef PROFILER
 extern unsigned long prof_insn, prof_hle, prof_skipcyc;
 #endif
+#ifdef PROFILER_CALLS
+uint32_t prof_call[1024];
+#endif
 #if defined(PROFILER_OPS) || defined(PROFILER_PCS)
 uint32_t prof_op_fn[2048], prof_op_cnt[2048]; int prof_op_on;
 #endif
@@ -988,8 +991,26 @@ static inline uint64_t xprof_read(uint64_t code) {
 static inline void xp_begin(xprof_t *p) { p->cyc -= xprof_read(0); p->ic -= xprof_read(0x11); p->dc -= xprof_read(0x21); }
 static inline void xp_end(xprof_t *p)   { p->cyc += xprof_read(0); p->ic += xprof_read(0x11); p->dc += xprof_read(0x21); }
 #endif
+#ifdef PROFILER_NAT
+/* cost of the native (AOT) functions alone, see emu.c [XNAT] */
+uint64_t xn_cyc, xn_ic, xn_dc, xn_calls;
+static inline uint64_t xn_read(uint64_t code) {
+	register int64_t slot asm("t0") = -1;
+	register uint64_t v asm("t1") = code;
+	asm volatile(".word 0x42000029 | (8 << 20) | (9 << 15)" : "+r"(v) : "r"(slot));
+	return v;
+}
+static inline void xn_begin(void) { xn_cyc -= xn_read(0); xn_ic -= xn_read(0x11); xn_dc -= xn_read(0x21); xn_calls++; }
+static inline void xn_end(void)   { xn_cyc += xn_read(0); xn_ic += xn_read(0x11); xn_dc += xn_read(0x21); }
+#endif
+#ifdef USE_HLE
+int m68ki_hle_check = 1;
+#endif
 M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 {
+#ifdef USE_HLE
+	if (!m68ki_hle_check) m68ki_hle_check = 1;   /* a new timeslice may start at an entrypoint */
+#endif
 	/* eat up any reset cycles */
 	if (RESET_CYCLES) {
 	    int rc = RESET_CYCLES;
@@ -1039,14 +1060,27 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 			 * RTS, or by bailing out on a call/jmp).  It updates REG_PC and
 			 * m68ki_remaining_cycles directly.  Then we resume the interpreter
 			 * at whatever PC the HLE function left us at. */
-			const HLEFunc *hle = hle_get_func(REG_PC);
-			if (hle) {
+			if (m68ki_hle_check) {
+				m68ki_hle_check--;
+				const HLEFunc *hle = hle_get_func(REG_PC);
+				if (hle) {
 #ifdef PROFILER
-				prof_hle++;
+					prof_hle++;
 #endif
-				REG_PPC = REG_PC;
-				REG_PC = hle->func(&m68ki_cpu, &m68ki_remaining_cycles, REG_PC);
-				continue;
+					REG_PPC = REG_PC;
+#ifdef PROFILER_NAT
+					xn_begin();
+#endif
+					REG_PC = hle->func(&m68ki_cpu, &m68ki_remaining_cycles, REG_PC);
+#ifdef PROFILER_NAT
+					xn_end();
+#endif
+					/* Native code often hands over a few instructions before
+					 * its next entrypoint (after an instruction it left to the
+					 * interpreter, or between two unrolled runs): keep looking. */
+					m68ki_hle_check = 8;
+					continue;
+				}
 			}
 #endif
 			REG_PPC = REG_PC;
@@ -1066,6 +1100,18 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 				uint32_t fn = (uint32_t)m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF], h = (fn * 2654435761u) >> 22;
 				while (prof_op_fn[h] != fn && prof_op_fn[h] != 0) h = (h + 1) & 1023;
 				prof_op_fn[h] = fn; prof_op_cnt[h]++;
+			}
+#endif
+#ifdef PROFILER_CALLS
+			{	/* record every BSR/JSR target: candidate entry points for the AOT list */
+				uint ir = REG_IR;
+				m68k_dispatch_l2[ir >> 8][ir & 0xFF]();
+				if ((ir & 0xFF00) == 0x6100 || (ir & 0xFFC0) == 0x4E80) {
+					uint32_t t = REG_PC, h = (t * 2654435761u) >> 22;
+					while (prof_call[h] != t && prof_call[h] != 0) h = (h + 1) & 1023;
+					prof_call[h] = t;
+				}
+				continue;
 			}
 #endif
 #ifdef PROFILER_DISP

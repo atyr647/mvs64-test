@@ -24,7 +24,12 @@ const opcode_handler_struct* decode_opcode(uint16_t op) {
 #define be16(a)  (((uint16_t)((a)[0]) << 8) | (a)[1])
 #define be32(a)  (((uint32_t)be16(a) << 16) | be16((a)+2))
 #define strstartwith(s, prefix) !strncmp(s, prefix, strlen(prefix))
-#define panic(s, ...) ({ fprintf(stderr, s, ##__VA_ARGS__); exit(1); })
+#include <setjmp.h>
+// While a function is being generated, a panic only skips that function (an
+// empty hle_<pc>.c is written and the PC stays interpreted): the PC list can
+// then come straight from a profile without hand-checking every routine.
+static jmp_buf gen_jmp; static int gen_active;
+#define panic(s, ...) ({ fprintf(stderr, s, ##__VA_ARGS__); if (gen_active) longjmp(gen_jmp, 1); exit(1); })
 
 bool stranyprefix(const char *line, const char **prefixes) {
 	while (*prefixes) {
@@ -274,14 +279,16 @@ int main(int argc, char *argv[]) {
 	fclose(f);
 
 	uint8_t *PROM = NULL; unsigned int PROM_BASE = 0;
+	struct image { unsigned int base; uint8_t *data; } *images = NULL;
 
 	// Hashtable that maps a PC entrypoint to recompiled function start. Normally,
 	// a function has a single entrypoint (at its beginning) so most entries
 	// will have key==value, but for functions with multiple entrypoints (those
 	// that contains subroutine calls, where we can resume execution), there
 	// will be more entries pointing to the same function.
-	struct { uint32_t key; uint32_t value; } *func_pcs = NULL;
+	static struct { uint32_t key; uint32_t value; } *func_pcs = NULL;
 struct { unsigned int key; bool value; } *extra_entries = NULL;
+	static struct run { unsigned int start, end, period; } *runs = NULL;
 
 	for (int fx=1;fx<argc;fx++) {
 		if (strchr(argv[fx], '.')) {
@@ -293,9 +300,11 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 			} else {
 				PROM_BASE = 0;
 			}
-			if (PROM) free(PROM);
 			printf("Loading %s (base: %x)...\n", fn, PROM_BASE);
 			PROM = load_rom(fn);
+			// Remember every image: each PC below uses the one loaded at
+			// the highest base not above it (game ROM at 0, BIOS at c00000).
+			arrput(images, ((struct image){ PROM_BASE, PROM }));
 			continue;
 		}
 
@@ -307,17 +316,41 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 			continue;
 		}
 
-		unsigned int initial_pc = strtoul(argv[fx], NULL, 16);
+		// "rPC": a run of unrolled code starting at PC: the same P bytes of
+		// straight-line instructions repeated many times (e.g. a table of
+		// "move.w (A3)+,(A2)" that the game jumps into at a computed offset).
+		// It becomes one native loop that can be entered at any repetition
+		// and stops when the timeslice is used up.
+		bool is_run = argv[fx][0] == 'r';
+		unsigned int run_period = 0, run_end = 0;
+		const char *pcarg = argv[fx] + (is_run ? 1 : 0);
+
+		unsigned int initial_pc = strtoul(pcarg, NULL, 16);
 		if (initial_pc == 0) {
 			printf("Invalid argument: %s (ignoring)\n", argv[fx]);
 			continue;
 		}
 		unsigned int pc = initial_pc;
+		for (int i=0;i<arrlen(images);i++)
+			if (images[i].base <= pc && (images[i].base >= PROM_BASE || PROM_BASE > pc)) { PROM = images[i].data; PROM_BASE = images[i].base; }
 
-		char outfn[32] = "hle_"; strcat(outfn, argv[fx]); strcat(outfn, ".c");
+		char outfn[32] = "hle_"; strcat(outfn, pcarg); strcat(outfn, ".c");
 		FILE *out = fopen(outfn, "w"); if (!out) panic("Cannot create: %s\n", outfn);
 
 		printf("Generating %s...\n", outfn);
+
+		static FILE *gen_out; static char gen_outfn[32]; static unsigned int gen_initial;
+		gen_out = out; strcpy(gen_outfn, outfn); gen_initial = initial_pc;
+		gen_active = 1;
+		if (setjmp(gen_jmp)) {
+			gen_active = 0;
+			fprintf(stderr, "  -> %x skipped (stays interpreted)\n", gen_initial);
+			fclose(gen_out);
+			FILE *o = fopen(gen_outfn, "w"); fprintf(o, "typedef int hle_not_generated_%x;\n", gen_initial); fclose(o);
+			for (int i=hmlen(func_pcs)-1;i>=0;i--) if (func_pcs[i].value == gen_initial) hmdel(func_pcs, func_pcs[i].key);
+			for (int i=arrlen(runs)-1;i>=0;i--) if (runs[i].start == gen_initial) arrdel(runs, i);
+			continue;
+		}
 
 		const uint8_t *func = PROM + pc - PROM_BASE;
 		struct { unsigned int key; bool value; } *forward_jumps = NULL;
@@ -325,9 +358,21 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 		// List of entrypoints within this function (besides the initial one)
 		uint32_t *entrypoints = NULL;
 
-		// Record the initial entrypoint at the start of the function in the
-		// global map.
-		hmput(func_pcs, pc, pc);
+		if (is_run) {
+			const uint8_t *b = PROM + pc - PROM_BASE;
+			for (run_period = 2; run_period <= 64; run_period += 2) {
+				int reps = 1;
+				while (!memcmp(b, b + reps*run_period, run_period)) reps++;
+				if (reps >= 8) { run_end = pc + reps*run_period; break; }
+			}
+			if (!run_end) panic("no periodic run at %x\n", pc);
+			printf("  run %x-%x, period %d bytes, %d repetitions\n", pc, run_end, run_period, (run_end-pc)/run_period);
+			arrput(runs, ((struct run){ pc, run_end, run_period }));
+		} else {
+			// Record the initial entrypoint at the start of the function in the
+			// global map.
+			hmput(func_pcs, pc, pc);
+		}
 
 		fprintf(out, "#include \"m68k_recompiler.h\"\n");
 		fprintf(out, "#pragma GCC diagnostic ignored \"-Wunused-label\"\n");
@@ -338,7 +383,10 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 		static int func_rank = 0;
 		fprintf(out, "__attribute__((section(\".text.m68k.%04d\")))\n", 10 + func_rank++);
 		fprintf(out, "uint32_t func_%08X(m68ki_cpu_core * restrict __m68ki_cpu, int * restrict __m68ki_remaining_cycles, uint32_t __entry_pc) {\n", pc);
-		fprintf(out, "\tif (__builtin_expect(__entry_pc != 0x%x, 0)) goto find_entrypoint;\n\n", pc);
+		if (is_run)
+			fprintf(out, "\tuint32_t __pc = __entry_pc;\n\tdo {\n");
+		else
+			fprintf(out, "\tif (__builtin_expect(__entry_pc != 0x%x, 0)) goto find_entrypoint;\n\n", pc);
 
 		int opcount = 0;
 		while (1) {
@@ -372,7 +420,7 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 				hmput(func_pcs, pc+oplen, initial_pc);
 				bool ends = strstr(oph->opcode_handler, "m68k_op_rte") || strstr(oph->opcode_handler, "m68k_op_stop");
 				pc += oplen; func += oplen;
-				if (++opcount > 10000) panic("function too long -- missing end of function");
+				if (++opcount > 800) panic("function too long (unrolled code or missing end): keep it interpreted or use a run\n");
 				if (ends && hmgeti(forward_jumps, pc) < 0) break;
 				continue;
 			}
@@ -478,6 +526,9 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 				hmput(forward_jumps, pc + oplen, true);
 			}
 
+			if (is_run && (target || strstr(body, "m68ki_jump") || strstr(body, "m68ki_branch_") || strstr(body, "goto ")))
+				panic("run at %x contains control flow: %s\n", initial_pc, disasm);
+
 			fprintf(out, "%s", body);
 
 			// If the function contains a jump or it's a subroutine call, it's
@@ -515,7 +566,12 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 
 			pc += oplen;
 			func += oplen;
-			if (++opcount > 10000) panic("function too long -- missing end of function");
+			if (++opcount > 800) panic("function too long (unrolled code or missing end): keep it interpreted or use a run\n");
+			if (is_run) {
+				if (pc == initial_pc + run_period) break;
+				if (pc > initial_pc + run_period) panic("run at %x: period splits an instruction\n", initial_pc);
+				continue;
+			}
 
 			// See if this is a possible exit point: search for an absolute jump
 			if (strstr(oph->opcode_handler, "m68k_op_rts_") || (strstr(oph->opcode_handler, "m68k_op_bra_") && is_backward_branch)) {
@@ -525,6 +581,18 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 					break;
 				}
 			}
+		}
+
+		if (is_run) {
+			// REG_PC inside the body is that of the first repetition; nothing
+			// in a run reads it, and it is set for real here.
+			fprintf(out, "\t\t__pc += %d;\n\t} while (__pc < 0x%x && *__m68ki_remaining_cycles > 0);\n", run_period, run_end);
+			fprintf(out, "\tREG_PC = __pc;\n\treturn __pc;\n}\n");
+			fclose(out);
+			gen_active = 0;
+			hmfree(forward_jumps);
+			arrfree(entrypoints);
+			continue;
 		}
 
 		fprintf(out, "\n\texit:\n");
@@ -546,6 +614,7 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 		}
 		fprintf(out, "}\n");
 		fclose(out);
+		gen_active = 0;
 
 		hmfree(forward_jumps);
 		arrfree(entrypoints);
@@ -573,6 +642,13 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 		if (func_pcs[i].key == func_pcs[i].value)
 			fprintf(out, "extern uint32_t func_%08X(m68ki_cpu_core *cpu, int *cycles, uint32_t pc);\n", func_pcs[i].value);
 
+	for (int i=0;i<arrlen(runs);i++)
+		fprintf(out, "extern uint32_t func_%08X(m68ki_cpu_core *cpu, int *cycles, uint32_t pc);\n", runs[i].start);
+	fprintf(out, "\nconst HLEFunc g_hle_runs[%d] = {\n", (int)arrlen(runs) + 1);
+	for (int i=0;i<arrlen(runs);i++)
+		fprintf(out, "\t{ .pc = 0x%08x, .func = func_%08X },\n", runs[i].start, runs[i].start);
+	fprintf(out, "};\n");
+
 	fprintf(out, "\nconst HLEFunc g_hle_funcs[%d] = {\n", ph_mask+1);
 	for (int i=0;i<ph_mask+1;i++) {
 		int idx = htable[i];
@@ -598,7 +674,12 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 	fprintf(out, "static inline const HLEFunc* hle_get_func(uint32_t pc) {\n");
 	fprintf(out, "\textern const HLEFunc g_hle_funcs[];\n");
 	fprintf(out, "\tconst HLEFunc *f = &g_hle_funcs[((pc * %d) >> %d) & 0x%x];\n", ph_mul, ph_shift, ph_mask);
-	fprintf(out, "\treturn pc == f->pc ? f : 0;\n");
+	fprintf(out, "\tif (pc == f->pc) return f;\n");
+	if (arrlen(runs)) fprintf(out, "\textern const HLEFunc g_hle_runs[];\n");
+	for (int i=0;i<arrlen(runs);i++)
+		fprintf(out, "\tif (pc - 0x%xu < 0x%xu && (pc - 0x%xu) %% %du == 0) return &g_hle_runs[%d];\n",
+			runs[i].start, runs[i].end - runs[i].start, runs[i].start, runs[i].period, i);
+	fprintf(out, "\treturn 0;\n");
 	fprintf(out, "}\n");
 
 	fprintf(out, "#endif\n");

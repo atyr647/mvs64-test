@@ -373,6 +373,19 @@ int main(int argc, char *argv[]) {
 				debugf("[STATE] frame=%d workram=%08lx\n", (int)g_frame, (unsigned long)h);
 			}
 			#endif
+			#ifdef PROFILER_NAT
+			extern uint64_t xn_cyc, xn_ic, xn_dc, xn_calls; static uint64_t n0[4];
+			if (g_frame == XSUM_START) { n0[0] = xn_cyc; n0[1] = xn_ic; n0[2] = xn_dc; n0[3] = xn_calls; }
+			if (g_frame == XSUM_END) debugf("[XSUM] native cycles=%lu icache_miss=%lu dcache_miss=%lu calls=%lu\n",
+				(unsigned long)((xn_cyc - n0[0]) / (XSUM_END - XSUM_START)), (unsigned long)((xn_ic - n0[1]) / (XSUM_END - XSUM_START)),
+				(unsigned long)((xn_dc - n0[2]) / (XSUM_END - XSUM_START)), (unsigned long)((xn_calls - n0[3]) / (XSUM_END - XSUM_START)));
+			#endif
+			#ifdef PROFILER_MISS
+			/* patched ares only (tools/prof/ares-missprof.patch): histogram of the code
+			 * lines and data accesses that miss the caches, written to $MISSPROF_OUT */
+			if (g_frame == XSUM_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
+			if (g_frame == XSUM_END)   { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
+			#endif
 			if (g_frame == XSUM_START) { xs_68k = t68k; xs_snd = tsnd; xs_draw = tdraw; xs_all = tall; xs_insn = tinsn; prof_op_on = 1; }
 			if (g_frame == XSUM_END) {
 				int nf = XSUM_END - XSUM_START; prof_op_on = 0;
@@ -388,6 +401,9 @@ int main(int argc, char *argv[]) {
 				#ifdef PROFILER_OPS
 				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFOP] %lx %lu\n", (unsigned long)prof_op_fn[i], (unsigned long)prof_op_cnt[i]);
 				#endif
+				#ifdef PROFILER_CALLS
+				{ extern uint32_t prof_call[1024]; for (int i = 0; i < 1024; i++) if (prof_call[i]) debugf("[PROFCALL] %lx\n", (unsigned long)prof_call[i]); }
+				#endif
 				#ifdef PROFILER_PCS
 				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFPC] %lx %lu\n", (unsigned long)((prof_op_fn[i] - 1) << 5), (unsigned long)prof_op_cnt[i]);
 				#endif
@@ -398,16 +414,32 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
 
+		/* Per-frame line for profiling builds only: formatting floats every
+		 * frame costs I-cache and a few % of the frame. */
+		#if defined(PROFILER) || defined(PROFILE_FRAMES)
 		debugf("[PROFILE] cpu:%.2f%% io:%lu draw:%.2f%% dma:%.2f%% PC:%06lx\n",
 			(float)emu_time * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(unsigned long)profile_hw_io,
 			(float)render_time * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_dma_load * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(uint32_t)emu_pc());
+		#else
+		(void)emu_time;
+		#endif
 		#endif
 
 		rom_next_frame();
 		#ifdef N64
+		{
+			/* Frame limiter: never run ahead of the video interrupt count.
+			 * Without it light scenes run at 80+ FPS: the game is too fast and
+			 * sends sound commands faster than the (real-time) Z80 can take
+			 * them, which loses commands and leaves the driver's ADPCM state
+			 * stuck.  When we are behind, emu_render pulls N64_FRAME back, so
+			 * no debt builds up. */
+			extern volatile int N64_FRAME;
+			while (N64_FRAME < g_frame) { /* wait for the VI interrupt */ }
+		}
 		uint32_t curtime = TICKS_READ();
 		if (TICKS_DISTANCE(fps_time, curtime) > TICKS_FROM_MS(1000)) {
 			debugf("FPS: %.1f\n", (g_frame - fps_frame) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime));

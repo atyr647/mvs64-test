@@ -1,0 +1,86 @@
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index b51000d..8924933 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -1,5 +1,34 @@
+ //NEC VR4300
+ 
++// --- miss profiler (local patch): which code/data causes cache misses ---
++#include <unordered_map>
++#include <vector>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++struct MissProf {
++  bool on = false;
++  std::unordered_map<u32,u32> icLine, dcPc, dcAddr;
++  std::unordered_map<u64,u32> dcPair;
++  void reset() { icLine.clear(); dcPc.clear(); dcAddr.clear(); dcPair.clear(); on = true; }
++  void dump() {
++    on = false;
++    const char* path = getenv("MISSPROF_OUT"); if(!path) path = "missprof.txt";
++    FILE* f = fopen(path, "w"); if(!f) return;
++    auto out = [&](const char* tag, std::unordered_map<u32,u32>& m) {
++      std::vector<std::pair<u32,u32>> v(m.begin(), m.end());
++      std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.second > b.second; });
++      for(auto& e : v) fprintf(f, "%s %08x %u\n", tag, e.first, e.second);
++    };
++    out("IC", icLine); out("DPC", dcPc); out("DAD", dcAddr);
++    { std::vector<std::pair<u64,u32>> v(dcPair.begin(), dcPair.end());
++      std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.second > b.second; });
++      for(auto& e : v) fprintf(f, "DPR %08x %08x %u\n", (u32)(e.first >> 32), (u32)e.first, e.second); }
++    fclose(f);
++  }
++};
++inline MissProf missProf;
++
+ struct CPU : Thread {
+   Node::Object node;
+ 
+@@ -208,6 +237,7 @@ struct CPU : Thread {
+       auto fill(u32 paddr, CPU& cpu) -> void {
+         cpu.step(48 * 2);
+         const u32 tag = paddr & ~0x0000'0fffu;
++        if(missProf.on) missProf.icLine[0x8000'0000u | tag | index]++;
+         tagKey = tag;
+         setValid(true);
+         cpu.busReadBurst<ICache>(tag | index, words);
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index 4de28e0..c64bb7c 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -7,6 +7,7 @@ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+   cpu.step(40 * 2);
+   const u32 tag = paddr & ~0x0000'0fffu;
+   dirty  = 0;
++  if(missProf.on) { missProf.dcPc[(u32)cpu.ipu.pc]++; missProf.dcAddr[0x8000'0000u | tag | index]++; missProf.dcPair[(u64)(u32)cpu.ipu.pc << 32 | (0x8000'0000u | tag | index)]++; }
+   tagKey = tag;
+   fillPc = cpu.ipu.pc;
+   setValid(cpu.busReadBurst<DCache>(tag | index, words));
+diff --git a/ares/n64/cpu/emux.cpp b/ares/n64/cpu/emux.cpp
+index e9dc54e..d83e26b 100644
+--- a/ares/n64/cpu/emux.cpp
++++ b/ares/n64/cpu/emux.cpp
+@@ -86,6 +86,8 @@ auto CPU::XHEXDUMP(cr64& rd, cr64& rt) -> void {
+ auto CPU::XPROF(cr64& rd, u64 code) -> void {
+     if(!system.homebrewMode) return;
+ 
++    if(code == 5) { missProf.reset(); return; }  //local patch: start miss profile
++    if(code == 6) { missProf.dump(); return; }   //local patch: write miss profile
+     if(code == 4) {  //reset profiling data
+         profileSlots.clear();
+         return;
+diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
+index b84272a..87aa627 100644
+--- a/ares/n64/cpu/recompiler.cpp
++++ b/ares/n64/cpu/recompiler.cpp
+@@ -812,7 +812,8 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+       const u32 burst = (slow.icachePaddr & ~0xfffu) | ((lineIndex << 5) & 0xfe0u);
+       const u32 tagKey = (slow.icachePaddr & ~0xfffu) | 1u;
+       const bool sdram = Model::Aleck64() && burst > 0xbfff'ffffu;
+-      if(!emitStateKey.rdramMapIdentity() || (!sdram && burst + 0x1f >= rdram.ram.size)) {
++      static const bool missProfSlow = getenv("MISSPROF_OUT") != nullptr;  //local patch: fills go through Line::fill
++      if(missProfSlow || !emitStateKey.rdramMapIdentity() || (!sdram && burst + 0x1f >= rdram.ram.size)) {
+         callf(&CPU::icacheFillLine, imm64(slow.vaddr), imm(slow.icachePaddr));
+       } else {
+         const sljit_sw ramDataField = sdram ? (sljit_sw)(uintptr_t)&aleck64.sdram.data
