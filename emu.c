@@ -377,8 +377,13 @@ int main(int argc, char *argv[]) {
 			if (g_frame % 500 == 0) {
 				/* state fingerprint: equal between two builds = same emulation result */
 				extern uint8_t WORK_RAM[]; uint32_t h = 2166136261u;
-				for (int i = 0; i < 0x10000; i++) h = (h ^ WORK_RAM[i]) * 16777619u;
-				debugf("[STATE] frame=%d workram=%08lx\n", (int)g_frame, (unsigned long)h);
+				char sl[16 * 5 + 1]; uint32_t hs = 2166136261u;
+				for (int i = 0; i < 0x10000; i++) {
+					h = (h ^ WORK_RAM[i]) * 16777619u; hs = (hs ^ WORK_RAM[i]) * 16777619u;
+					if ((i & 0xfff) == 0xfff) { sprintf(sl + 5 * (i >> 12), "%04x ", (unsigned)(hs & 0xffff)); hs = 2166136261u; }
+				}
+				/* per-4 KB slices locate a difference (e.g. only the stack page) */
+				debugf("[STATE] frame=%d workram=%08lx %s\n", (int)g_frame, (unsigned long)h, sl);
 			}
 			#endif
 			#ifdef PROFILER_NAT
