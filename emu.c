@@ -180,6 +180,7 @@ uint32_t emu_vblank_start(void* arg) {
 }
 
 uint32_t render_time;
+static uint32_t g_drawn;   /* frames actually drawn (adaptive frameskip skips the rest) */
 
 uint32_t emu_render(void *arg) {
 
@@ -226,6 +227,7 @@ uint32_t emu_render(void *arg) {
 	#ifdef N64
 	uint32_t t0 = TICKS_READ();
 	#endif
+	g_drawn++;
 	XP_BEGIN(xp_draw);
 	plat_beginframe();
 	video_render();
@@ -462,7 +464,10 @@ int main(int argc, char *argv[]) {
 		}
 		uint32_t curtime = TICKS_READ();
 		if (TICKS_DISTANCE(fps_time, curtime) > TICKS_FROM_MS(1000)) {
-			debugf("FPS: %.1f\n", (g_frame - fps_frame) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime));
+			static uint32_t fps_drawn;
+			debugf("FPS: %.1f drawn %.1f\n", (g_frame - fps_frame) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime),
+				(g_drawn - fps_drawn) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime));
+			fps_drawn = g_drawn;
 			sound_debug_stats();
 			fps_frame = g_frame;
 			fps_time = curtime;
