@@ -74,15 +74,26 @@ reports as dropouts.
 Env: `BIOS` (NeoGeo BIOS; `sfix.sfix` beside it), `N64_INST`, `ARES`
 (default `/opt/pak-ares/bin/ares`), `GAME_ZIP`, `AUTOPLAY_SECONDS`.
 
-## ADPCM-A on the RSP
+## Audio pipeline (N64)
 
-ADPCM-A is decoded on the RSP (`cmd_adpcma_render` in `rsp_fm.S`). The CPU
-stages each chunk's bytes and end handling (`adpcma_stage`), and
-`adpcma_model` in `ym2610_intf.c` is a C model of the RSP routine. Host builds
-run the model, so the host suite checks it against ymfm and the old
-decoder's output. `SND_CFLAGS=-DADPCMA_VERIFY` runs the model next to the RSP
-on the N64 and logs `[AVERIFY] <chunks>, <n> mismatched` (outputs and state
-must match bit for bit; 0 mismatches over 40,960 gameplay chunks in ares).
+The RSP renders FM, ADPCM-A and the SSG; the CPU runs the Z80, applies the
+register writes and renders ADPCM-B. Each AI buffer is issued as a batch of
+chunks, each with its own parameter snapshot (`struct chunk_slot`). The RSP
+carries the FM phases, the ADPCM-A decoders and the SSG generator from chunk
+to chunk in RDRAM (`fm_dyn`, `mix_dyn`), and the CPU never waits for it: the
+last buffer of each pump is held and mixed at the next pump, one frame later.
+The render clock is absolute (sample *s* is Z80 cycle *s* x 4 MHz / 22050
+since boot), so audio does not depend on the frame rate.
+
+C models (`adpcma_model`, `ssg_model`, `mix_merge`) mirror the RSP code; the
+host builds run them, so the host suite checks them against ymfm.
+Verify builds run the models on the N64 next to the RSP and compare every
+batch bit for bit:
+
+* `SND_CFLAGS=-DADPCMA_VERIFY`: ADPCM-A + SSG outputs and RSP state
+  (`[AVERIFY] <n> batches, 0 mismatched`)
+* `SND_CFLAGS=-DFM_VERIFY`: FM outputs against `rspfm_model.h`'s model
+  (`[FMVERIFY]`)
 
 ## Other switches
 

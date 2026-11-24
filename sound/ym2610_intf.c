@@ -27,7 +27,11 @@
 #define Z80_RAM_SIZE    (2 * 1024)    /* 2 KB work RAM */
 
 static uint8_t z80_rom[Z80_ROM_SIZE];
-static uint8_t z80_ram[Z80_RAM_SIZE];
+/* The RAM ($F800-$FFFF) is followed by a copy of the first ROM bytes: CZ80
+ * fetches opcodes through a host pointer, so code that runs past $FFFF must
+ * continue at $0000 as on the real Z80, not in whatever memory follows. */
+#define Z80_WRAP_BYTES  64
+static uint8_t z80_ram[Z80_RAM_SIZE + Z80_WRAP_BYTES];
 static cz80_struc z80_cpu;
 
 /* Absolute Z80 time (cycles since boot), also valid inside Cz80_Exec: I/O
@@ -300,13 +304,17 @@ static void ym2610_write_reg2(uint8_t addr, uint8_t val);
 
 static void z80_map_banks(void)
 {
-	/* Keep CZ80's opcode-fetch pages in sync with the bank windows. */
+	/* Keep CZ80's opcode-fetch pages in sync with the bank windows.
+	 * Cz80_Set_Fetch takes the host address of the region's first byte (it
+	 * subtracts the Z80 start address itself); these used to be pre-offset,
+	 * so code fetched from the bank windows or RAM came from the wrong host
+	 * memory (Blazing Star's driver waits in a "JP $FFFD" loop in RAM). */
 	Cz80_Set_Fetch(&z80_cpu, 0x0000, 0x7FFF, (uintptr_t)z80_rom);
-	Cz80_Set_Fetch(&z80_cpu, 0x8000, 0xBFFF, (uintptr_t)(z80_rom + z80_bank_off[3]) - 0x8000);
-	Cz80_Set_Fetch(&z80_cpu, 0xC000, 0xDFFF, (uintptr_t)(z80_rom + z80_bank_off[2]) - 0xC000);
-	Cz80_Set_Fetch(&z80_cpu, 0xE000, 0xEFFF, (uintptr_t)(z80_rom + z80_bank_off[1]) - 0xE000);
-	Cz80_Set_Fetch(&z80_cpu, 0xF000, 0xF7FF, (uintptr_t)(z80_rom + z80_bank_off[0]) - 0xF000);
-	Cz80_Set_Fetch(&z80_cpu, 0xF800, 0xFFFF, (uintptr_t)z80_ram - 0xF800);
+	Cz80_Set_Fetch(&z80_cpu, 0x8000, 0xBFFF, (uintptr_t)(z80_rom + z80_bank_off[3]));
+	Cz80_Set_Fetch(&z80_cpu, 0xC000, 0xDFFF, (uintptr_t)(z80_rom + z80_bank_off[2]));
+	Cz80_Set_Fetch(&z80_cpu, 0xE000, 0xEFFF, (uintptr_t)(z80_rom + z80_bank_off[1]));
+	Cz80_Set_Fetch(&z80_cpu, 0xF000, 0xF7FF, (uintptr_t)(z80_rom + z80_bank_off[0]));
+	Cz80_Set_Fetch(&z80_cpu, 0xF800, 0xFFFF, (uintptr_t)z80_ram);
 }
 
 static UINT8 z80_read(UINT32 addr)
@@ -342,10 +350,13 @@ typedef struct { uint32_t t; uint8_t port, addr, val, pad; } ymq_t;
 #define YMQ_MIN_SEG 8            /* shortest render segment (0.36 ms) */
 static ymq_t ymq[YMQ_SIZE];
 static unsigned ymq_head, ymq_tail;
-/* Render clock: output sample rclk_pos of the current frame is Z80 time
- * rclk_base + samples_to_z80(rclk_pos). */
+/* Render clock: output sample rclk_pos is Z80 time
+ * rclk_base + rclk_pos * Z80_CLOCK / SND_OUTPUT_RATE.  On the N64 both count
+ * from boot and never restart, so a register write lands on the same sample
+ * whatever the frame rate or the pump's schedule.  (The host harnesses render
+ * 368 samples per 66666-cycle frame and restart it every frame.) */
 static uint64_t rclk_base;
-static uint32_t rclk_pos;
+static uint64_t rclk_pos;
 
 static void ymq_apply_one(void)
 {
@@ -366,6 +377,10 @@ static void ym_write_timed(int port, uint8_t addr, uint8_t val)
 	ymq_tail = (ymq_tail + 1) & (YMQ_SIZE - 1);
 }
 
+static inline uint64_t rclk_now64(void)
+{
+	return rclk_base + (rclk_pos * Z80_CLOCK) / SND_OUTPUT_RATE;
+}
 static inline uint32_t rclk_now(void)
 {
 	return (uint32_t)(rclk_base + (uint64_t)(((uint64_t)rclk_pos * Z80_CLOCK) / SND_OUTPUT_RATE));
@@ -656,7 +671,8 @@ static void slot_key(int ch_idx, int op, int on)
 	ym_slot_t *s = &ym_ch[ch_idx].slot[op];
 	if (on && !s->key_on) {
 		s->key_on = 1;
-		fm_state.ch[ch_idx].phase[op] = 0;          /* phase restarts on key-on */
+		fm_state.ch[ch_idx].phase[op] = 0;          /* phase restarts on key-on (host model) */
+		fm_state.reset |= (uint16_t)(1u << (4 * ch_idx + op));   /* ... and on the RSP */
 		if (s->r_ar >= 62) { s->env = 0; s->eg_state = EG_DEC; }   /* instant attack */
 		else               { s->eg_state = EG_ATT; }
 	} else if (!on && s->key_on) {
@@ -816,12 +832,15 @@ static void ym_write_fm_reg(int ch_pair, uint8_t addr, uint8_t val)
  * 2*NP units, the envelope every 2*EP units (16 levels per ramp). */
 
 static uint8_t  ssg_reg[16];
-static uint32_t ssg_cnt[3], ssg_noise_cnt, ssg_env_cnt;
-static uint8_t  ssg_tone[3];
-static uint32_t ssg_lfsr = 1;
-static uint8_t  ssg_noise_bit;
-static uint32_t ssg_env_state;      /* ymfm: 0..31 ramp position, 32 = finished/held */
-static int32_t  ssg_dc;
+/* The generator state (counters, LFSR, envelope, DC blocker) is carried by
+ * the RSP from chunk to chunk in mix_dyn; the CPU stages the registers. */
+static struct rsp_fm_dyn  fm_dyn  __attribute__((aligned(16)));
+static struct rsp_mix_dyn mix_dyn __attribute__((aligned(16)));
+static uint8_t ssg_restart_pending;   /* shape register written since the last chunk */
+#ifdef ADPCMA_VERIFY
+static struct rsp_mix_dyn verify_dyn;         /* shadow of mix_dyn, run by the C models */
+static int32_t verify_out[2 * 1024];
+#endif
 
 #define SSG_TICKS_Q16   743040u   /* (250000 / 22050) * 65536 */
 
@@ -838,34 +857,9 @@ static const int16_t ssg_amp[32] = {
  * Calibrated against ymfm with a register stimulus (110 measured 0.649). */
 #define SSG_MIX_Q8  73
 
-static void ssg_env_restart(void)
-{
-	ssg_env_state = 0;          /* writing the shape register restarts the envelope */
-}
 
-static inline int ssg_env_held(void)
-{
-	int shape = ssg_reg[0xD];
-	return ((shape & 1) | (((shape >> 3) & 1) ^ 1));   /* hold, or no continue */
-}
 
-static void ssg_env_step(void)
-{
-	if (ssg_env_held() && ssg_env_state >= 32) { ssg_env_state = 32; return; }
-	ssg_env_state = (ssg_env_state + 1) & 63;
-}
 
-static inline int ssg_env_volume(void)
-{
-	int shape = ssg_reg[0xD];
-	int cont = (shape >> 3) & 1, att = (shape >> 2) & 1, alt = (shape >> 1) & 1;
-	if (ssg_env_held() && ssg_env_state >= 32) {
-		ssg_env_state = 32;
-		return ((att ^ alt) & cont) ? 31 : 0;
-	}
-	if (alt) att ^= (ssg_env_state >> 5) & 1;
-	return (int)(ssg_env_state & 31) ^ (att ? 0 : 31);
-}
 
 #ifdef SND_SELFTEST
 static uint64_t st_rendered;   /* output samples rendered since boot */
@@ -881,59 +875,9 @@ static void ssg_write(uint8_t addr, uint8_t val)
 	static const uint8_t mask[16] = { 0xFF,0x0F,0xFF,0x0F,0xFF,0x0F,0x1F,0xFF,
 	                                  0x1F,0x1F,0x1F,0xFF,0xFF,0x0F,0xFF,0xFF };
 	ssg_reg[addr & 15] = val & mask[addr & 15];
-	if ((addr & 15) == 0x0D) ssg_env_restart();
+	if ((addr & 15) == 0x0D) ssg_restart_pending = 1;   /* restarts the envelope */
 }
 
-/* One 22050 Hz output sample of SSG output (unipolar levels, DC-blocked) */
-static int32_t ssg_sample(void)
-{
-	/* tone */
-	for (int c = 0; c < 3; c++) {
-		uint32_t tp = ((uint32_t)(ssg_reg[c * 2 + 1] & 15) << 8) | ssg_reg[c * 2];
-		if (!tp) tp = 1;
-		ssg_cnt[c] += SSG_TICKS_Q16;
-		uint32_t thr = tp << 16;
-		while (ssg_cnt[c] >= thr) { ssg_cnt[c] -= thr; ssg_tone[c] ^= 1; }
-	}
-	/* noise: 17-bit LFSR, taps 0 and 3 */
-	{
-		uint32_t np = ssg_reg[6] & 31;
-		if (!np) np = 1;
-		ssg_noise_cnt += SSG_TICKS_Q16;
-		uint32_t thr = (np * 2) << 16;
-		while (ssg_noise_cnt >= thr) {
-			ssg_noise_cnt -= thr;
-			uint32_t b = (ssg_lfsr ^ (ssg_lfsr >> 3)) & 1;
-			ssg_lfsr = (ssg_lfsr >> 1) | (b << 16);
-			ssg_noise_bit = ssg_lfsr & 1;
-		}
-	}
-	/* envelope */
-	{
-		uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8);
-		if (!ep) ep = 1;
-		ssg_env_cnt += SSG_TICKS_Q16;
-		uint32_t thr = ep << 16;
-		while (ssg_env_cnt >= thr) { ssg_env_cnt -= thr; ssg_env_step(); }
-	}
-	/* mix */
-	int32_t mix = 0;
-	int envv = -1;
-	for (int c = 0; c < 3; c++) {
-		int tone_dis  = (ssg_reg[7] >> c) & 1;
-		int noise_dis = (ssg_reg[7] >> (c + 3)) & 1;
-		if ((ssg_tone[c] | tone_dis) & (ssg_noise_bit | noise_dis)) {
-			int a = ssg_reg[8 + c], v;
-			if (a & 0x10) { if (envv < 0) envv = ssg_env_volume(); v = envv; }
-			else          { v = (a & 15) * 2; if (v) v |= 1; }
-			mix += ssg_amp[v];
-		}
-	}
-	mix = (mix * SSG_MIX_Q8) >> 8;
-	/* remove DC (constant-high channels, volume steps) */
-	ssg_dc += ((mix << 8) - ssg_dc) >> 9;      /* Q8 running mean, no integer stall */
-	return mix - ((ssg_dc + 128) >> 8);
-}
 
 #ifndef ADPCMA_GAIN_SHIFT
 #define ADPCMA_GAIN_SHIFT 1
@@ -965,11 +909,9 @@ typedef struct {
 	uint32_t end;         /* first byte address AFTER the sample (end register + 1) << 8 */
 	uint8_t  byte;        /* byte currently being decoded */
 	uint32_t chunk_base;  /* ROM offset of the chunk in adpcma_buf, or ~0 */
-	uint32_t frac;        /* resampling phase (decoder state: adpcma_rsp) */
+	uint32_t frac;        /* resampling phase (decoder state: RSP, mix_dyn) */
+	uint8_t  reset;       /* keyed on since the last chunk: reset the decoder */
 } adpcma_t;
-/* decoder state shared with the RSP, see adpcma_stage() */
-static struct rsp_adpcma_state adpcma_rsp __attribute__((aligned(16)));
-static int32_t adpcma_out[2 * 128] __attribute__((aligned(16)));   /* L,R sums per sample */
 
 static adpcma_t adpcma[6];
 static uint8_t  adpcma_total = 0x3F;      /* total level register, 0..63 */
@@ -993,8 +935,7 @@ static void adpcma_keyon(int ch)
 	a->pos  = (uint32_t)a->start_reg << 8;
 	a->end  = ((uint32_t)a->end_reg + 1) << 8;
 	a->hi = 1; a->frac = 0;
-	adpcma_rsp.ch[ch].acc = 0; adpcma_rsp.ch[ch].step = 0;
-	adpcma_rsp.ch[ch].s0 = adpcma_rsp.ch[ch].s1 = 0;
+	a->reset = 1;                 /* the RSP zeroes acc/step/s0/s1 */
 	a->chunk_base = ~(uint32_t)0;
 	a->on = 1;
 	stat_adpcma_keyons++;
@@ -1032,8 +973,8 @@ static void adpcma_write(uint8_t addr, uint8_t val)
 
 /* ---- ADPCM-A rendering (on the RSP, see rsp_fm.h) ----
  *
- * The decoder state (acc, step, s0, s1) lives in adpcma_rsp, which the RSP
- * reads and writes back every chunk.  The CPU keeps the addresses: ADPCM-A
+ * The decoder state (acc, step, s0, s1) is carried by the RSP (mix_dyn);
+ * each chunk gets a parameter snapshot.  The CPU keeps the addresses: ADPCM-A
  * runs slower than the output rate, so a chunk decodes exactly
  * (frac + n*RATE) >> 16 nibbles, and where the sample ends follows from the
  * addresses alone. */
@@ -1041,13 +982,13 @@ static void adpcma_write(uint8_t addr, uint8_t val)
 /* Prepare one chunk of n samples: per channel, how many samples to produce,
  * its volume and pan, and the bytes it will decode.  Returns nonzero when
  * some channel is audible. */
-static int adpcma_stage(int n)
+static int adpcma_stage(struct rsp_adpcma_state *P, int n)
 {
 	int any = 0;
 	for (int c = 0; c < 6; c++) {
 		adpcma_t *a = &adpcma[c];
-		struct rsp_adpcma_chan *ch = &adpcma_rsp.ch[c];
-		if (!a->on) { ch->nsamp = 0; continue; }
+		struct rsp_adpcma_chan *ch = &P->ch[c];
+		if (!a->on) { ch->nsamp = 0; ch->out = 0; continue; }
 		int vol = ((a->level ^ 0x1F) & 0x1F) + ((adpcma_total ^ 0x3F) & 0x3F);
 		int audible = vol < 63 && (a->pan & 0xC0);
 		ch->out = audible ? (((a->pan >> 7) & 1) | (((a->pan >> 6) & 1) << 1)) : 0;
@@ -1070,9 +1011,10 @@ static int adpcma_stage(int n)
 		}
 		ch->nsamp = (uint16_t)ns; ch->k0 = (uint8_t)k0; ch->frac = (uint16_t)frac;
 		if (ns && ch->out) any = 1;
+		if (a->reset) { ch->out |= 0x80; a->reset = 0; }
 
 		/* stage the bytes holding nibbles k0 .. k0+dec-1 */
-		uint8_t *b = adpcma_rsp.bytes[c];
+		uint8_t *b = P->bytes[c];
 		uint32_t base = a->pos - (uint32_t)k0;     /* address of b[0] */
 		uint32_t t = (uint32_t)k0 + dec, nb = (t + 1) >> 1;
 		if (k0) b[0] = a->byte;
@@ -1083,6 +1025,28 @@ static int adpcma_stage(int n)
 		a->frac = (frac + (uint32_t)ns * ADPCMA_RATE_Q16) & 0xFFFF;
 	}
 	return any;
+}
+
+/* The RSP's merge / unmerge of the dynamic state (cmd_adpcma_render). */
+static void mix_merge(struct rsp_adpcma_state *P, const struct rsp_mix_dyn *d)
+{
+	for (int c = 0; c < 6; c++) {
+		struct rsp_adpcma_chan *ch = &P->ch[c];
+		if (ch->out & 0x80) { ch->acc = ch->step = ch->s0 = ch->s1 = 0; }
+		else { ch->acc = d->a[c].acc; ch->step = d->a[c].step; ch->s0 = d->a[c].s0; ch->s1 = d->a[c].s1; }
+		ch->out &= 0x7F;
+	}
+	memcpy(&P->ssg, d->ssg, 32);
+	memcpy(P->ssg.tone, d->ssg + 32, 4);
+	if (P->ssg.restart) P->ssg.env_state = 0;
+}
+static void mix_unmerge(const struct rsp_adpcma_state *P, struct rsp_mix_dyn *d)
+{
+	for (int c = 0; c < 6; c++) {
+		d->a[c].acc = P->ch[c].acc; d->a[c].step = P->ch[c].step; d->a[c].s0 = P->ch[c].s0; d->a[c].s1 = P->ch[c].s1;
+	}
+	memcpy(d->ssg, &P->ssg, 32);
+	memcpy(d->ssg + 32, P->ssg.tone, 4);
 }
 
 /* C model of cmd_adpcma_render in rsp_fm.S, operation for operation: used
@@ -1281,42 +1245,68 @@ static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
 		ym_adpcm_status = (ym_adpcm_status & ~0xC0) | live | (live << 1);
 }
 
-static void ssg_render(int32_t *acc, int32_t *accR, int n)
+/* Stage the SSG registers for one chunk (the RSP runs the generator). */
+static void ssg_stage(struct rsp_ssg_state *s)
 {
-	int silent = 1;
-	for (int c = 0; c < 3; c++) if (ssg_reg[8 + c] & 0x1F) silent = 0;
-	if (silent && ssg_dc == 0) {
-		/* Nothing audible and DC settled: just advance the tone, noise and
-		 * envelope counters by n samples so they stay exactly in phase. */
-		uint64_t adv = (uint64_t)n * SSG_TICKS_Q16;
-		for (int c = 0; c < 3; c++) {
-			uint32_t tp = ((uint32_t)(ssg_reg[c * 2 + 1] & 15) << 8) | ssg_reg[c * 2];
-			if (!tp) tp = 1;
-			uint64_t thr = (uint64_t)tp << 16, t = ssg_cnt[c] + adv;
-			ssg_tone[c] ^= (uint8_t)((t / thr) & 1);
-			ssg_cnt[c] = (uint32_t)(t % thr);
-		}
-		{
-			uint32_t np = ssg_reg[6] & 31; if (!np) np = 1;
-			uint64_t thr = (uint64_t)(np * 2) << 16, t = ssg_noise_cnt + adv;
-			for (uint64_t k = t / thr; k; k--) {
-				uint32_t b = (ssg_lfsr ^ (ssg_lfsr >> 3)) & 1;
-				ssg_lfsr = (ssg_lfsr >> 1) | (b << 16);
-			}
-			ssg_noise_bit = ssg_lfsr & 1;
-			ssg_noise_cnt = (uint32_t)(t % thr);
-		}
-		{
-			uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8); if (!ep) ep = 1;
-			uint64_t thr = (uint64_t)ep << 16, t = ssg_env_cnt + adv;
-			uint64_t k = t / thr;
-			if (ssg_env_held()) ssg_env_state = (ssg_env_state + k >= 32) ? 32 : ssg_env_state + (uint32_t)k;
-			else                ssg_env_state = (uint32_t)((ssg_env_state + k) & 63);
-			ssg_env_cnt = (uint32_t)(t % thr);
-		}
-		return;
+	for (int c = 0; c < 3; c++) {
+		uint32_t tp = ((uint32_t)(ssg_reg[c * 2 + 1] & 15) << 8) | ssg_reg[c * 2];
+		if (!tp) tp = 1;
+		s->thr[c] = tp << 16;
+		s->vol[c] = ssg_reg[8 + c];
 	}
-	for (int i = 0; i < n; i++) { int32_t v = ssg_sample(); if (v) stat_ssg_nonzero++; int32_t m = v < 0 ? -v : v; if (m > pk_ssg) pk_ssg = m; acc[i] += v; accR[i] += v; }   /* SSG is mono */
+	{ uint32_t np = ssg_reg[6] & 31; if (!np) np = 1; s->nthr = (np * 2) << 16; }
+	{ uint32_t ep = ssg_reg[0xB] | ((uint32_t)ssg_reg[0xC] << 8); if (!ep) ep = 1; s->ethr = ep << 16; }
+	s->mixer = ssg_reg[7]; s->shape = ssg_reg[0xD];
+	s->active = 1;
+	s->restart = ssg_restart_pending; ssg_restart_pending = 0;
+}
+
+/* C model of the SSG part of cmd_adpcma_render (the former per-sample
+ * generator, unchanged): adds 2 * sample to both lanes of out (if out). */
+static void ssg_model(struct rsp_ssg_state *s, int n, int32_t *out)
+{
+	if (!s->active) return;
+	int held = (s->shape & 1) | (((s->shape >> 3) & 1) ^ 1);
+	int cont = (s->shape >> 3) & 1, att0 = (s->shape >> 2) & 1, alt = (s->shape >> 1) & 1;
+	for (int i = 0; i < n; i++) {
+		for (int c = 0; c < 3; c++) {
+			s->cnt[c] += SSG_TICKS_Q16;
+			while (s->cnt[c] >= s->thr[c]) { s->cnt[c] -= s->thr[c]; s->tone[c] ^= 1; }
+		}
+		s->noise_cnt += SSG_TICKS_Q16;
+		while (s->noise_cnt >= s->nthr) {
+			s->noise_cnt -= s->nthr;
+			uint32_t b = (s->lfsr ^ (s->lfsr >> 3)) & 1;
+			s->lfsr = (s->lfsr >> 1) | (b << 16);
+			s->noise_bit = s->lfsr & 1;
+		}
+		s->env_cnt += SSG_TICKS_Q16;
+		while (s->env_cnt >= s->ethr) {
+			s->env_cnt -= s->ethr;
+			if (held && s->env_state >= 32) s->env_state = 32;
+			else s->env_state = (s->env_state + 1) & 63;
+		}
+		int32_t mix = 0;
+		int envv = -1;
+		for (int c = 0; c < 3; c++) {
+			int tone_dis = (s->mixer >> c) & 1, noise_dis = (s->mixer >> (c + 3)) & 1;
+			if ((s->tone[c] | tone_dis) & (s->noise_bit | noise_dis)) {
+				int a = s->vol[c], v;
+				if (a & 0x10) {
+					if (envv < 0) {
+						if (held && s->env_state >= 32) { s->env_state = 32; envv = ((att0 ^ alt) & cont) ? 31 : 0; }
+						else { int att = att0; if (alt) att ^= (s->env_state >> 5) & 1; envv = (int)(s->env_state & 31) ^ (att ? 0 : 31); }
+					}
+					v = envv;
+				} else { v = (a & 15) * 2; if (v) v |= 1; }
+				mix += ssg_amp[v];
+			}
+		}
+		mix = (mix * SSG_MIX_Q8) >> 8;
+		s->dc += ((mix << 8) - s->dc) >> 9;      /* Q8 running mean (DC blocker) */
+		int32_t v = mix - ((s->dc + 128) >> 8);
+		if (out) { out[2 * i] += 2 * v; out[2 * i + 1] += 2 * v; }
+	}
 }
 
 static void ym2610_write_reg1(uint8_t addr, uint8_t val)
@@ -1446,11 +1436,19 @@ void sound_init(const uint8_t *rom, int rom_size)
 		for (int o = 0; o < 4; o++) { ym_ch[c].slot[o].env = EG_MAX; ym_ch[c].slot[o].eg_state = EG_OFF; }
 	for (int c = 0; c < 4; c++) { ym_ch[c].pan = 0xC0; fm_state.ch[c].pan = 0xC0; }
 	eg_acc = 0; eg_cnt = 1;
-	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F; memset(&adpcma_rsp, 0, sizeof(adpcma_rsp));
+	memset(adpcma, 0, sizeof(adpcma)); adpcma_total = 0x3F;
 	memset(adpcmb_reg, 0, sizeof(adpcmb_reg)); adpcmb_reset(); adpcmb_clk_acc = 0; ym_flag_mask = 0xBF;
 	for (int c = 0; c < 6; c++) { adpcma[c].level = 0x1F; adpcma[c].pan = 0xC0; }
-	memset(ssg_reg, 0, sizeof(ssg_reg)); memset(ssg_cnt, 0, sizeof(ssg_cnt)); memset(ssg_tone, 0, sizeof(ssg_tone));
-	ssg_noise_cnt = 0; ssg_lfsr = 1; ssg_noise_bit = 0; ssg_dc = 0; ssg_env_restart();
+	memset(ssg_reg, 0, sizeof(ssg_reg)); ssg_restart_pending = 0;
+	/* RSP-owned state: everything zero, SSG LFSR = 1 */
+	memset(&fm_dyn, 0, sizeof(fm_dyn)); memset(&mix_dyn, 0, sizeof(mix_dyn));
+	{ uint32_t one = 1; memcpy(&mix_dyn.ssg[20], &one, 4); }
+#ifdef ADPCMA_VERIFY
+	memcpy(&verify_dyn, &mix_dyn, sizeof(mix_dyn));
+#endif
+#ifdef N64
+	rsp_audio_init_dyn(&fm_dyn, sizeof(fm_dyn)); rsp_audio_init_dyn(&mix_dyn, sizeof(mix_dyn));
+#endif
 
 	timer_a_val = 0;
 	timer_b_val = 0;
@@ -1471,6 +1469,7 @@ void sound_init(const uint8_t *rom, int rom_size)
 	if (rom && rom_size > 0) {
 		int copy_size = rom_size < Z80_ROM_SIZE ? rom_size : Z80_ROM_SIZE;
 		memcpy(z80_rom, rom, copy_size);
+		memcpy(z80_ram + Z80_RAM_SIZE, z80_rom, Z80_WRAP_BYTES);   /* $10000.. = $0000.. */
 		z80_has_rom = 1;
 #ifdef N64
 		debugf("[SND] sound_init: M1 ROM loaded, %d bytes, first8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -1706,32 +1705,40 @@ void sound_frame_begin(void)
 {
 	if (!z80_has_rom) return;
 	snd_frame_tick();
+	/* how far the Z80 already is ahead of the next sample to render */
+	z80_carry = (int32_t)((int64_t)z80_time - (int64_t)rclk_now64());
 	int t = samples_to_z80(snd_plan) - z80_carry;
 	z80_frame_target = t > 0 ? t : 0;
 	z80_frame_done = 0;
-	/* the next sample to render is z80_carry cycles behind the Z80 */
-	rclk_base = z80_time - (int64_t)z80_carry; rclk_pos = 0;
 }
 
 #ifdef N64
 /* Render one block of n samples into dst, first advancing the Z80 to the
  * point in time the block ends at.  `rendered` = samples already rendered
  * this frame. */
-static void pump_block(int16_t *dst, int n, int rendered)
+static void pump_block(int n, int rendered)
 {
-	/* z80_carry = cycles the Z80 had already run ahead of rendered audio when
-	 * this frame began, so this frame only needs to reach (time - carry). */
-	int need = samples_to_z80(rendered + n) - z80_carry;
-	if (need > z80_frame_done) {
-		z80_run(need - z80_frame_done);
-		z80_frame_done = need;
+	(void)rendered;
+	/* the Z80 must have produced everything up to the end of this block */
+	uint64_t end = rclk_base + ((rclk_pos + (uint64_t)n) * Z80_CLOCK) / SND_OUTPUT_RATE;
+	if ((int64_t)(end - z80_target) > 0) {
+		int c = (int)(end - z80_target);
+		z80_run(c);
+		z80_frame_done += c;
 	}
-	sound_render(dst, n);
+	sound_render_issue(n);
 }
+
+/* The last AI buffer of each pump is held (begun, not ended) while the RSP
+ * renders it during the next frame; the next pump mixes and queues it.
+ * libdragon plays buffers in order and stops at a held one, so this only
+ * adds one frame of latency.  The Z80 timing is unchanged. */
+static int16_t *held_buf;
 
 int sound_pump(void)
 {
 	if (!z80_has_rom) return 0;
+	if (held_buf) { sound_render_finish(held_buf); audio_write_end(); held_buf = NULL; }
 	int rendered = 0;
 	const int limit = 3 * audio_get_buffer_length();   /* bound the catch-up after a stall */
 	/* libdragon keeps 4 buffers, 2 of them queued in the AI.  Being able to
@@ -1740,15 +1747,19 @@ int sound_pump(void)
 	while (rendered < limit && audio_can_write()) {
 		int n = audio_get_buffer_length();
 		int16_t *dst = (int16_t *)audio_write_begin();
-		pump_block(dst, n, rendered);
-		audio_write_end();
+		pump_block(n, rendered);
 		rendered += n;
+		if (rendered < limit && audio_can_write()) {
+			/* catching up: more buffers free, finish this one now */
+			sound_render_finish(dst);
+			audio_write_end();
+		} else {
+			held_buf = dst;
+			break;
+		}
 	}
 	if (rendered >= 3 * audio_get_buffer_length()) stat_underruns++;
 	stat_pumped += rendered;
-	/* Whatever the Z80 ran beyond the audio rendered so far carries forward
-	 * (it ran ahead under sound_sync while the AI was full). */
-	z80_carry += z80_frame_done - samples_to_z80(rendered);
 	/* Smoothed expectation of samples per frame, for next frame's Z80 budget */
 	snd_plan = (snd_plan * 7 + rendered + 4) / 8;
 	if (snd_plan < 64) snd_plan = 64;
@@ -1816,30 +1827,208 @@ static void setup_test_fm_channel(void)
 #define FM_MIX_SHIFT 3   /* 2, +1 for the FM_OVERSAMPLE (=2) steps summed per sample */
 #endif
 
-static int render_segment(int16_t *buf, int max_samples);
-
-/* Render max_samples (<= 1024), applying queued register writes at their
- * sample: the block is split into segments at the writes' times. */
-int sound_render(int16_t *buf, int max_samples)
+#ifdef FM_VERIFY
+/* tools/soundtest/rspfm_model.h, at 22050 Hz, on the tables rsp_fm.c uploads */
+extern uint16_t rsp_sin_tab[256], rsp_exp_tab[256];
+static struct rsp_fm_dyn fmv_dyn;              /* shadow of fm_dyn */
+static int32_t fmv_out[2 * 1024];
+static int32_t fmv_opcalc(uint32_t t5, uint16_t vol)
 {
-	int n = max_samples > 1024 ? 1024 : max_samples, done = 0;
-	while (done < n) {
-		int seg = ymq_step(n - done);
-		render_segment(buf + 2 * done, seg);
-		done += seg; rclk_pos += seg;
-	}
-	return n;
+	int neg = t5 & 0x200;
+	t5 = (t5 & 0x100) ? ((t5 & 0xFF) ^ 0xFF) : (t5 & 0xFF);
+	uint32_t p = ((uint32_t)(vol & 0xFFFE) << 2) + rsp_sin_tab[t5];
+	if (p >= 3328) return 0;
+	int32_t o = rsp_exp_tab[p & 0xFF] >> (p >> 8);
+	return neg ? -o : o;
 }
-
-static int render_segment(int16_t *buf, int max_samples)
+static void fmv_model(struct rsp_fm_state *st, int32_t *out, int n)
 {
-	stat_frames++;
-	int nsamples = max_samples;
-	if (nsamples > 1024) nsamples = 1024;
+	memset(out, 0, n * 8);
+	for (int c = 0; c < 4; c++) {
+		struct rsp_fm_chan *ch = &st->ch[c];
+		if (!ch->enabled) continue;
+		for (int j = 0; j < n * FM_OVERSAMPLE; j++) { int i = j / FM_OVERSAMPLE;
+			int32_t pm = 0;
+			if (ch->fb_shift) { uint32_t t5 = (uint32_t)ch->op1_out + ((uint32_t)ch->op1_out << 16); pm = ((int32_t)t5 >> 16) << ch->fb_shift; }
+			int32_t o1 = fmv_opcalc((ch->phase[0] + pm) >> 16, ch->vol_out[0]);
+			uint32_t t2 = ((uint32_t)ch->op1_out << 16) | ((uint32_t)o1 & 0xFFFF); ch->op1_out = (int32_t)t2;
+			int32_t s1 = (int32_t)t2 >> 16;
+			int32_t t4 = ch->c1_mod ? s1 : 0;
+			int32_t s2 = fmv_opcalc((ch->phase[1] >> 16) + (t4 >> 1), ch->vol_out[1]);
+			t4 = ch->m2_mod ? ch->mem : 0;
+			int32_t s3 = fmv_opcalc((ch->phase[2] >> 16) + (t4 >> 1), ch->vol_out[2]);
+			switch (ch->c2_mod) { case 1: t4 = s3; break; case 2: t4 = s1 + s3; break; case 3: t4 = ch->mem + s3; break; case 4: t4 = s1; break; default: t4 = 0; }
+			int32_t s5 = fmv_opcalc((ch->phase[3] >> 16) + (t4 >> 1), ch->vol_out[3]);
+			switch (ch->mem_src) { case 1: ch->mem = s2; break; case 2: ch->mem = s1 + s2; break; case 3: ch->mem = s1; break; }
+			int32_t acc = 0; if (ch->out_flags & 1) acc += s1; if (ch->out_flags & 2) acc += s2; if (ch->out_flags & 4) acc += s3; if (ch->out_flags & 8) acc += s5;
+			if (ch->pan & 0x80) out[2 * i] += acc;
+			if (ch->pan & 0x40) out[2 * i + 1] += acc;
+			for (int k = 0; k < 4; k++) ch->phase[k] += ch->incr[k];
+		}
+	}
+}
+#endif
+
+/* ---- Rendering: issue a batch now, mix it later ----
+ *
+ * sound_render_issue() walks the batch in chunks (split at queued register
+ * writes and at the envelope interval).  Per chunk it snapshots the FM
+ * parameters, stages ADPCM-A and the SSG, and queues the RSP commands; the
+ * RSP carries the FM phases, ADPCM-A decoders and SSG generator from chunk
+ * to chunk itself (fm_dyn, mix_dyn), so nothing has to come back before the
+ * next chunk.  ADPCM-B runs on the CPU here.  sound_render_finish() waits for
+ * the RSP (on the N64 pump: a frame later, long done) and mixes. */
+#ifndef EG_CHUNK
+#define EG_CHUNK 92
+#endif
+#define BATCH_MAX   1024
+#define SLOTS       32                /* chunk parameter snapshots in flight */
+struct chunk_slot {
+	struct rsp_fm_state fm;           /* 232 */
+	uint8_t pad[8];
+	struct rsp_adpcma_state a;        /* 448 */
+} __attribute__((aligned(16)));
+static struct chunk_slot slots[SLOTS];
+static int slot_next;
+static int32_t adpcma_out_b[2 * BATCH_MAX] __attribute__((aligned(16)));   /* ADPCM-A + 2*SSG, L,R */
+static int32_t bmix[BATCH_MAX], bmixR[BATCH_MAX];                           /* ADPCM-B */
+static int batch_n;
+
+static void issue_chunk(int off, int n)
+{
+#ifdef N64
+	uint32_t e0 = TICKS_READ();
+#endif
 #if SOUND_DEBUG_MODE == 3
 	setup_test_fm_channel();   /* hardcoded FM channel through the real RSP path */
 #endif
+#if SOUND_DEBUG_MODE != 3
+	eg_run(n);
+	eg_push();
+#endif
+#ifdef N64
+	uint32_t e1 = TICKS_READ();
+	prof_eg += TICKS_DISTANCE(e0, e1);
+	if (slot_next == SLOTS) {             /* all snapshots in flight: let the RSP catch up */
+		rsp_audio_kick(); rsp_audio_wait(); slot_next = 0;
+	}
+#else
+	slot_next %= SLOTS;
+#endif
+	struct chunk_slot *sl = &slots[slot_next++];
+	fm_state.num_samples = n;
+	sl->fm = fm_state;                    /* FM parameter snapshot (+ key-on resets) */
+	fm_state.reset = 0;
+	adpcma_stage(&sl->a, n);
+	ssg_stage(&sl->a.ssg);
+	int32_t *fm = fm_output + 2 * off, *ao = adpcma_out_b + 2 * off;
+#ifdef N64
+	uint32_t q1 = TICKS_READ();
+	prof_a += TICKS_DISTANCE(e1, q1);     /* staging */
+	rsp_fm_render(&sl->fm, &fm_dyn, fm);
+	rsp_adpcma_render(&sl->a, &mix_dyn, n, ao);
+#ifdef FM_VERIFY
+	{	/* FM: the model on a shadow of fm_dyn, merged as the RSP does */
+		static struct rsp_fm_state t; memcpy(&t, &sl->fm, sizeof(t));
+		for (int c = 0; c < 4; c++) {
+			for (int k = 0; k < 4; k++) t.ch[c].phase[k] = (t.reset >> (4 * c + k)) & 1 ? 0 : fmv_dyn.ch[c].phase[k];
+			t.ch[c].op1_out = fmv_dyn.ch[c].op1_out; t.ch[c].mem = fmv_dyn.ch[c].mem;
+		}
+		fmv_model(&t, fmv_out + 2 * off, n);
+		for (int c = 0; c < 4; c++) {
+			for (int k = 0; k < 4; k++) fmv_dyn.ch[c].phase[k] = t.ch[c].phase[k];
+			fmv_dyn.ch[c].op1_out = t.ch[c].op1_out; fmv_dyn.ch[c].mem = t.ch[c].mem;
+		}
+	}
+#endif
+#ifdef ADPCMA_VERIFY
+	{	/* the C models on a CPU-side shadow, compared in sound_render_finish */
+		static struct rsp_adpcma_state tmp; memcpy(&tmp, &sl->a, sizeof(tmp));
+		mix_merge(&tmp, &verify_dyn);
+		memset(verify_out + 2 * off, 0, (size_t)n * 8);
+		adpcma_model(&tmp, n, verify_out + 2 * off);
+		ssg_model(&tmp.ssg, n, verify_out + 2 * off);
+		mix_unmerge(&tmp, &verify_dyn);
+	}
+#endif
+	memset(bmix + off, 0, n * sizeof(int32_t)); memset(bmixR + off, 0, n * sizeof(int32_t));
+	uint32_t q2 = TICKS_READ();
+	adpcmb_render(bmix + off, bmixR + off, n);
+	prof_b += TICKS_DISTANCE(q2, TICKS_READ());
+#else
+	/* host: the C models, exactly as the RSP runs them */
+	memset(fm, 0, n * 2 * sizeof(int32_t));   /* FM is checked through tools/soundtest's model */
+	mix_merge(&sl->a, &mix_dyn);
+	adpcma_model(&sl->a, n, ao);
+	if (snd_host_mute & 2) memset(ao, 0, (size_t)n * 8);
+	ssg_model(&sl->a.ssg, n, (snd_host_mute & 1) ? NULL : ao);
+	mix_unmerge(&sl->a, &mix_dyn);
+	memset(bmix + off, 0, n * sizeof(int32_t)); memset(bmixR + off, 0, n * sizeof(int32_t));
+	static int32_t scr[EG_CHUNK], scrR[EG_CHUNK];
+	adpcmb_render((snd_host_mute & 2) ? scr : bmix + off, (snd_host_mute & 2) ? scrR : bmixR + off, n);
+#endif
+}
 
+/* Queue max_samples (<= 1024) of output; register writes are applied at
+ * their sample (the batch is split into segments at the writes' times). */
+void sound_render_issue(int max_samples)
+{
+#ifdef N64
+	uint32_t t0 = TICKS_READ();
+#endif
+	int n = max_samples > BATCH_MAX ? BATCH_MAX : max_samples, done = 0;
+	slot_next = 0;
+	while (done < n) {
+		int seg = ymq_step(n - done);
+		for (int o = 0; o < seg; ) {
+			int k = seg - o > EG_CHUNK ? EG_CHUNK : seg - o;
+			issue_chunk(done + o, k);
+			o += k;
+		}
+		stat_frames++;
+		done += seg; rclk_pos += seg;
+	}
+	batch_n = n;
+#ifdef N64
+	rsp_audio_kick();
+	prof_mix += TICKS_DISTANCE(t0, TICKS_READ());
+#endif
+}
+
+/* Wait for the batch queued by sound_render_issue() and mix it into buf. */
+void sound_render_finish(int16_t *buf)
+{
+	int nsamples = batch_n;
+#ifdef N64
+	uint32_t t0 = TICKS_READ();
+	rsp_audio_wait();
+	uint32_t t1 = TICKS_READ();
+#ifdef FM_VERIFY
+	{
+		static uint32_t batches, bad;
+		int i = 0; while (i < 2 * nsamples && fmv_out[i] == fm_output[i]) i++;
+		batches++;
+		if (i < 2 * nsamples && bad++ < 10)
+			debugf("[FMVERIFY] batch %lu: output diff at %d of %d (model %ld rsp %ld)\n", (unsigned long)batches, i, 2 * nsamples,
+				(long)fmv_out[i], (long)fm_output[i]);
+		if ((batches & 255) == 0) debugf("[FMVERIFY] %lu batches, %lu mismatched\n", (unsigned long)batches, (unsigned long)bad);
+	}
+#endif
+#ifdef ADPCMA_VERIFY
+	{
+		static uint32_t batches, bad;
+		data_cache_hit_invalidate(&mix_dyn, sizeof(mix_dyn));
+		int i = 0; while (i < 2 * nsamples && verify_out[i] == adpcma_out_b[i]) i++;
+		int dyn_bad = memcmp(&verify_dyn, &mix_dyn, 84) != 0;
+		batches++;
+		if ((i < 2 * nsamples || dyn_bad) && bad++ < 10)
+			debugf("[AVERIFY] batch %lu: output diff at %d of %d (model %ld rsp %ld), state %s\n", (unsigned long)batches, i, 2 * nsamples,
+				(long)(i < 2 * nsamples ? verify_out[i] : 0), (long)(i < 2 * nsamples ? adpcma_out_b[i] : 0), dyn_bad ? "DIFFERS" : "same");
+		if ((batches & 255) == 0) debugf("[AVERIFY] %lu batches, %lu mismatched\n", (unsigned long)batches, (unsigned long)bad);
+	}
+#endif
+	prof_rsp += TICKS_DISTANCE(t0, t1);
+#endif
 #if SOUND_DEBUG_MODE == 1
 	/* 440Hz sine wave at 22050Hz: period = 50 samples */
 	static int phase = 0;
@@ -1856,7 +2045,7 @@ static int render_segment(int16_t *buf, int max_samples)
 		buf[i*2+0] = s;
 		buf[i*2+1] = s;
 	}
-	return nsamples;
+	return;
 
 #elif SOUND_DEBUG_MODE == 2
 	/* Audible square wave: flip every 25 samples → 441Hz */
@@ -1867,114 +2056,33 @@ static int render_segment(int16_t *buf, int max_samples)
 		buf[i*2+0] = val;
 		buf[i*2+1] = val;
 	}
-	return nsamples;
+	return;
 
 #else
-	/* Mix FM + SSG + ADPCM-A + ADPCM-B.  Per chunk (= the envelope update
-	 * interval, <= 128 samples for the RSP's buffer) the RSP renders the FM
-	 * while the CPU renders SSG and ADPCM for the same samples; the FM is
-	 * added once the RSP is done. */
-	#ifndef EG_CHUNK
-	#define EG_CHUNK 92
-	#endif
-	static int32_t mix[EG_CHUNK], mixR[EG_CHUNK];
-#ifdef N64
-	uint32_t t_all = TICKS_READ(), t_wait = 0;
-#endif
-	for (int off = 0; off < nsamples; ) {
-		int n = nsamples - off;
-		if (n > EG_CHUNK) n = EG_CHUNK;
-#ifdef N64
-		uint32_t e0 = TICKS_READ();
-#endif
-#if SOUND_DEBUG_MODE != 3
-		eg_run(n);
-		eg_push();
-#endif
-#ifdef N64
-		prof_eg += TICKS_DISTANCE(e0, TICKS_READ());
-#endif
-		int32_t *fm = fm_output + 2 * off, *ml = mix, *mr = mixR;
-#ifdef N64
-		uint32_t q0 = TICKS_READ();
-		int aany = adpcma_stage(n);
-#ifdef ADPCMA_VERIFY
-		static struct rsp_adpcma_state vcopy; memcpy(&vcopy, &adpcma_rsp, sizeof(vcopy));
-#endif
-		uint32_t q1 = TICKS_READ();
-		fm_state.num_samples = n;
-		rsp_fm_render(&fm_state, fm);            /* asynchronous: FM ... */
-		rsp_adpcma_render(&adpcma_rsp, n, adpcma_out);   /* ... and ADPCM-A */
-		memset(ml, 0, n * sizeof(int32_t)); memset(mr, 0, n * sizeof(int32_t));
-		uint32_t q2 = TICKS_READ();
-		ssg_render(ml, mr, n);
-		uint32_t q3 = TICKS_READ();
-		adpcmb_render(ml, mr, n);
-		uint32_t q4 = TICKS_READ();
-		prof_a += TICKS_DISTANCE(q0, q1); prof_ssg += TICKS_DISTANCE(q2, q3); prof_b += TICKS_DISTANCE(q3, q4);
-		rsp_fm_wait();   /* state and output were written by RSP DMA; the submits dropped our cached copies */
-		t_wait += TICKS_DISTANCE(q4, TICKS_READ());
-#ifdef ADPCMA_VERIFY
-		{
-			/* the RSP must match the C model bit for bit */
-			static int32_t ref[2 * 128]; static uint32_t chunks, bad;
-			adpcma_model(&vcopy, n, ref);
-			int diff = memcmp(ref, adpcma_out, (size_t)n * 8) != 0 || memcmp(&vcopy.ch, &adpcma_rsp.ch, sizeof(vcopy.ch)) != 0;
-			chunks++;
-			if (diff && bad++ < 10) {
-				int i = 0; while (i < 2 * n && ref[i] == adpcma_out[i]) i++;
-				debugf("[AVERIFY] chunk %lu n=%d: first output diff at %d (model %ld, rsp %ld)\n", (unsigned long)chunks, n, i,
-					(long)(i < 2 * n ? ref[i] : 0), (long)(i < 2 * n ? adpcma_out[i] : 0));
-				for (int ch = 0; ch < 6; ch++) if (memcmp(&vcopy.ch[ch], &adpcma_rsp.ch[ch], 16))
-					debugf("[AVERIFY]   ch%d model acc=%d step=%d s0=%d s1=%d frac=%u | rsp acc=%d step=%d s0=%d s1=%d frac=%u\n", ch,
-						vcopy.ch[ch].acc, vcopy.ch[ch].step, vcopy.ch[ch].s0, vcopy.ch[ch].s1, vcopy.ch[ch].frac,
-						adpcma_rsp.ch[ch].acc, adpcma_rsp.ch[ch].step, adpcma_rsp.ch[ch].s0, adpcma_rsp.ch[ch].s1, adpcma_rsp.ch[ch].frac);
-			}
-			if ((chunks & 2047) == 0) debugf("[AVERIFY] %lu chunks, %lu mismatched\n", (unsigned long)chunks, (unsigned long)bad);
+	{
+		/* FM + (ADPCM-A + 2*SSG) / 2 + ADPCM-B, clamp, store */
+		int32_t fhi = 0, flo = 0, ohi = 0, olo = 0, ahi = 0, alo = 0; uint32_t clip = 0, nz = 0;
+		for (int i = 0; i < nsamples; i++) {
+			int32_t fl = fm_output[2 * i] >> FM_MIX_SHIFT, fr = fm_output[2 * i + 1] >> FM_MIX_SHIFT;
+			fhi = fl > fhi ? fl : fhi; flo = fl < flo ? fl : flo;
+			fhi = fr > fhi ? fr : fhi; flo = fr < flo ? fr : flo;
+			int32_t al = adpcma_out_b[2 * i] >> ADPCMA_GAIN_SHIFT, ar = adpcma_out_b[2 * i + 1] >> ADPCMA_GAIN_SHIFT;
+			ahi = al > ahi ? al : ahi; alo = al < alo ? al : alo;
+			int32_t l = bmix[i] + fl + al, r = bmixR[i] + fr + ar;
+			if (l > 32767) { l = 32767; clip++; } else if (l < -32768) { l = -32768; clip++; }
+			if (r > 32767) { r = 32767; clip++; } else if (r < -32768) { r = -32768; clip++; }
+			nz += (l | r) != 0;
+			ohi = l > ohi ? l : ohi; olo = l < olo ? l : olo;
+			ohi = r > ohi ? r : ohi; olo = r < olo ? r : olo;
+			buf[2 * i] = (int16_t)l; buf[2 * i + 1] = (int16_t)r;
 		}
-#endif
-#else
-		memset(fm, 0, n * 2 * sizeof(int32_t));   /* host builds: FM is checked via the C model */
-		memset(ml, 0, n * sizeof(int32_t)); memset(mr, 0, n * sizeof(int32_t));
-		/* host tests: snd_host_mute bit0 SSG, bit1 ADPCM (A+B); a muted source
-		 * still runs, into a scratch buffer */
-		static int32_t scr[EG_CHUNK], scrR[EG_CHUNK];
-		int aany = adpcma_stage(n);
-		adpcma_model(&adpcma_rsp, n, adpcma_out);
-		if (snd_host_mute & 2) { aany = 0; memset(adpcma_out, 0, (size_t)n * 8); }
-		ssg_render((snd_host_mute & 1) ? scr : ml, (snd_host_mute & 1) ? scrR : mr, n);
-		adpcmb_render((snd_host_mute & 2) ? scr : ml, (snd_host_mute & 2) ? scrR : mr, n);
-#endif
-		if (aany) stat_adpcma_nonzero += n;
-		/* add the FM, clamp, store; peaks via max/min (no per-sample abs) */
-		{
-			int32_t fhi = 0, flo = 0, ohi = 0, olo = 0, ahi = 0, alo = 0; uint32_t clip = 0, nz = 0;
-			int16_t *dst = buf + 2 * off;
-			for (int i = 0; i < n; i++) {
-				int32_t fl = fm[2 * i] >> FM_MIX_SHIFT, fr = fm[2 * i + 1] >> FM_MIX_SHIFT;
-				fhi = fl > fhi ? fl : fhi; flo = fl < flo ? fl : flo;
-				fhi = fr > fhi ? fr : fhi; flo = fr < flo ? fr : flo;
-				int32_t al = adpcma_out[2 * i] >> ADPCMA_GAIN_SHIFT, ar = adpcma_out[2 * i + 1] >> ADPCMA_GAIN_SHIFT;
-				ahi = al > ahi ? al : ahi; alo = al < alo ? al : alo;
-				int32_t l = ml[i] + fl + al, r = mr[i] + fr + ar;
-				if (l > 32767) { l = 32767; clip++; } else if (l < -32768) { l = -32768; clip++; }
-				if (r > 32767) { r = 32767; clip++; } else if (r < -32768) { r = -32768; clip++; }
-				nz += (l | r) != 0;
-				ohi = l > ohi ? l : ohi; olo = l < olo ? l : olo;
-				ohi = r > ohi ? r : ohi; olo = r < olo ? r : olo;
-				dst[2 * i] = (int16_t)l; dst[2 * i + 1] = (int16_t)r;
-			}
-			pk_fm = fhi > pk_fm ? fhi : pk_fm; pk_fm = -flo > pk_fm ? -flo : pk_fm;
-			stat_peak = ohi > stat_peak ? ohi : stat_peak; stat_peak = -olo > stat_peak ? -olo : stat_peak;
-			stat_clipped += clip; stat_nonzero += nz;
-			pk_a = ahi > pk_a ? ahi : pk_a; pk_a = -alo > pk_a ? -alo : pk_a;
-		}
-		off += n;
+		pk_fm = fhi > pk_fm ? fhi : pk_fm; pk_fm = -flo > pk_fm ? -flo : pk_fm;
+		pk_a = ahi > pk_a ? ahi : pk_a; pk_a = -alo > pk_a ? -alo : pk_a;
+		stat_peak = ohi > stat_peak ? ohi : stat_peak; stat_peak = -olo > stat_peak ? -olo : stat_peak;
+		stat_clipped += clip; stat_nonzero += nz;
 	}
 #ifdef N64
-	/* rsp_fm = time the CPU still waits for the RSP; mix = everything else */
-	prof_rsp += t_wait;
-	prof_mix += TICKS_DISTANCE(t_all, TICKS_READ()) - t_wait;
+	prof_mix += TICKS_DISTANCE(t1, TICKS_READ());
 #endif
 
 #if defined(SND_SELFTEST) && defined(N64)
@@ -2005,6 +2113,16 @@ static int render_segment(int16_t *buf, int max_samples)
 	st_rendered += nsamples;
 #endif
 
-	return nsamples;
+#ifdef SND_SELFTEST
+	st_rendered += nsamples;
 #endif
+#endif
+}
+
+/* Synchronous render (host harnesses): issue + finish. */
+int sound_render(int16_t *buf, int max_samples)
+{
+	sound_render_issue(max_samples);
+	sound_render_finish(buf);
+	return batch_n;
 }

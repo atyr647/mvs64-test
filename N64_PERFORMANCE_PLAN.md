@@ -35,6 +35,23 @@ Also fixed: a 60 Hz frame limiter (light scenes ran at 86 FPS and lost sound
 commands), and the FM table upload's `rspq_wait()` (hung the RSP queue in
 ares about one boot in two; now a syncpoint queued with the command).
 
+**Audio pipeline** (after this round): the RSP renders FM, ADPCM-A and the
+SSG for a whole AI buffer while the CPU emulates the next frame; the CPU no
+longer waits for it. Sound CPU cost 24% -> 19% of real time, real FPS 43.7
+-> 44.9 (production build, ares, from 40 s). Verified bit-exact: FM,
+ADPCM-A and SSG against their C models on the N64 (0 mismatches), the
+self-test capture identical to the synchronous design.
+
+Two emulation bugs found on the way:
+- **Z80 opcode fetch from banked ROM and RAM** pointed $8000-$F800 bytes too
+  low in host memory (`Cz80_Set_Fetch` takes the region's host start; the
+  pointers were pre-offset). Code run from RAM or the bank windows executed
+  garbage that depended on the memory layout: Blazing Star's driver waits in
+  a `JP $FFFD` loop in RAM after command $01.
+- **Render clock rounding**: mapping Z80 time to samples restarted every
+  frame, so a register write could land a sample earlier or later depending
+  on the frame schedule. It is now absolute.
+
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
 11%. 68K I-cache misses alone are ~36% of a 60 Hz frame; the interpreter
 spends ~270 clocks per interpreted instruction, mostly cache misses.

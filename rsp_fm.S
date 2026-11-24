@@ -3,9 +3,9 @@
     .data
 
     RSPQ_BeginOverlayHeader
-        RSPQ_DefineCommand cmd_fm_render, 12
+        RSPQ_DefineCommand cmd_fm_render, 16
         RSPQ_DefineCommand cmd_fm_init_tables, 12
-        RSPQ_DefineCommand cmd_adpcma_render, 12
+        RSPQ_DefineCommand cmd_adpcma_render, 16
     RSPQ_EndOverlayHeader
 
     RSPQ_BeginSavedState
@@ -21,11 +21,26 @@ adpcma_steps:
     .half 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552
 adpcma_inc:
     .byte -1, -1, -1, -1, 2, 5, 7, 9
+    .align 2
+ssg_tick:
+    .word 743040                     /* SSG_TICKS_Q16 */
+    /* SSG volume -> amplitude (ymfm) */
+    .align 1
+ssg_amp:
+    .half 0, 32, 78, 141, 178, 222, 262, 306, 369, 441, 509, 585, 701, 836, 965, 1112
+    .half 1334, 1595, 1853, 2146, 2576, 3081, 3576, 4135, 5000, 6006, 7023, 8155, 9963, 11976, 14132, 16382
 
     .bss
     .align 3
-adpcma_state: .space 384      /* struct rsp_adpcma_state: 6 x 16 bytes of state, 6 x 48 staged bytes */
+adpcma_state: .space 448      /* struct rsp_adpcma_state: 6 x 16 ADPCM-A, 64 SSG, 6 x 48 staged bytes */
 rdram_astate: .space 4
+rdram_fmdyn:  .space 4
+rdram_mixdyn: .space 4
+    .align 3
+fm_dyn:      .space 96       /* struct rsp_fm_dyn */
+mix_dyn:     .space 96       /* struct rsp_mix_dyn */
+ssg_tmp:     .space 4        /* held, envmax, att0, alt */
+ssg_tmp_ra:  .space 4
     .align 3
 chan_state:  .space 232       /* YM2610: 4 channels * 56 + 8 header; multiple of 8 so work_out stays DMA-aligned */
 work_out:   .space 1024      /* up to 128 stereo samples: int32 L,R interleaved */
@@ -81,12 +96,61 @@ cmd_fm_render:
     sw      a2, %lo(rdram_out)
     andi    k1, a0, 0xFFFF          /* k1 = num_samples */
 
-    /* DMA channel state from RDRAM to DMEM (YM2610: 232 bytes) */
+    /* DMA the parameter snapshot (232 bytes) and the dynamic state (96) */
+    sw      a3, %lo(rdram_fmdyn)
     move    s0, a1
     li      s4, %lo(chan_state)
     li      t0, DMA_SIZE(232, 1)
     jal     DMAIn
     nop
+    lw      s0, %lo(rdram_fmdyn)
+    li      s4, %lo(fm_dyn)
+    li      t0, DMA_SIZE(96, 1)
+    jal     DMAIn
+    nop
+    /* merge: phases (0 where the reset mask says key-on), op1_out, mem */
+    lhu     t7, %lo(chan_state) + 226
+    li      v1, %lo(chan_state)
+    li      t6, %lo(fm_dyn)
+    li      fp, 4
+fm_merge:
+    lw      t0, 0(t6)
+    andi    t1, t7, 1
+    beqz    t1, fm_mg0
+    nop
+    move    t0, zero
+fm_mg0:
+    sw      t0, 0(v1)
+    lw      t0, 4(t6)
+    andi    t1, t7, 2
+    beqz    t1, fm_mg1
+    nop
+    move    t0, zero
+fm_mg1:
+    sw      t0, 4(v1)
+    lw      t0, 8(t6)
+    andi    t1, t7, 4
+    beqz    t1, fm_mg2
+    nop
+    move    t0, zero
+fm_mg2:
+    sw      t0, 8(v1)
+    lw      t0, 12(t6)
+    andi    t1, t7, 8
+    beqz    t1, fm_mg3
+    nop
+    move    t0, zero
+fm_mg3:
+    sw      t0, 12(v1)
+    lw      t0, 16(t6)
+    sw      t0, 44(v1)
+    lw      t0, 20(t6)
+    sw      t0, 48(v1)
+    srl     t7, t7, 4
+    addiu   v1, v1, 56
+    addiu   fp, fp, -1
+    bnez    fp, fm_merge
+    addiu   t6, t6, 24              /* (delay slot) */
 
     /* Clear output buffer (stereo: 8 bytes per sample) */
     li      t3, %lo(work_out)
@@ -429,10 +493,30 @@ chan_next:
     bnez    fp, chan_loop
     nop
 
-    /* ---- DMA state back to RDRAM (YM2610: 232 bytes) ---- */
-    lw      s0, %lo(rdram_state)
-    li      s4, %lo(chan_state)
-    li      t0, DMA_SIZE(232, 1)
+    /* ---- dynamic state back to RDRAM (96 bytes) ---- */
+    li      v1, %lo(chan_state)
+    li      t6, %lo(fm_dyn)
+    li      fp, 4
+fm_unmerge:
+    lw      t0, 0(v1)
+    sw      t0, 0(t6)
+    lw      t0, 4(v1)
+    sw      t0, 4(t6)
+    lw      t0, 8(v1)
+    sw      t0, 8(t6)
+    lw      t0, 12(v1)
+    sw      t0, 12(t6)
+    lw      t0, 44(v1)
+    sw      t0, 16(t6)
+    lw      t0, 48(v1)
+    sw      t0, 20(t6)
+    addiu   v1, v1, 56
+    addiu   fp, fp, -1
+    bnez    fp, fm_unmerge
+    addiu   t6, t6, 24
+    lw      s0, %lo(rdram_fmdyn)
+    li      s4, %lo(fm_dyn)
+    li      t0, DMA_SIZE(96, 1)
     jal     DMAOut
     nop
 
@@ -467,11 +551,56 @@ cmd_adpcma_render:
     sw      a2, %lo(rdram_out)
     andi    k1, a0, 0xFFFF
 
+    sw      a3, %lo(rdram_mixdyn)
     move    s0, a1
     li      s4, %lo(adpcma_state)
-    li      t0, DMA_SIZE(384, 1)
+    li      t0, DMA_SIZE(448, 1)
     jal     DMAIn
     nop
+    lw      s0, %lo(rdram_mixdyn)
+    li      s4, %lo(mix_dyn)
+    li      t0, DMA_SIZE(96, 1)
+    jal     DMAIn
+    nop
+    /* merge the decoder state (zeros on key-on) ... */
+    li      v1, %lo(adpcma_state)
+    li      t6, %lo(mix_dyn)
+    li      fp, 6
+a_merge:
+    lw      t0, 0(t6)
+    lw      t1, 4(t6)
+    lbu     t2, 13(v1)              /* out flags, bit 7 = key-on */
+    andi    t3, t2, 0x80
+    beqz    t3, a_mg
+    andi    t2, t2, 0x7F
+    move    t0, zero
+    move    t1, zero
+a_mg:
+    sb      t2, 13(v1)
+    sw      t0, 0(v1)
+    sw      t1, 4(v1)
+    addiu   v1, v1, 16
+    addiu   fp, fp, -1
+    bnez    fp, a_merge
+    addiu   t6, t6, 8
+    /* ... and the SSG state: 32 bytes, then tone / noise bits */
+    li      v1, %lo(adpcma_state) + 96
+    li      t6, %lo(mix_dyn) + 48
+    li      fp, 8
+s_merge:
+    lw      t0, 0(t6)
+    sw      t0, 0(v1)
+    addiu   v1, v1, 4
+    addiu   fp, fp, -1
+    bnez    fp, s_merge
+    addiu   t6, t6, 4
+    lw      t0, %lo(mix_dyn) + 80
+    sw      t0, %lo(adpcma_state) + 96 + 52
+    lbu     t0, %lo(adpcma_state) + 96 + 62   /* envelope restart */
+    beqz    t0, s_norestart
+    nop
+    sw      zero, %lo(adpcma_state) + 96 + 24
+s_norestart:
 
     li      t3, %lo(work_out)
     sll     t4, k1, 3
@@ -483,7 +612,7 @@ a_clear:
     nop
 
     li      v1, %lo(adpcma_state)
-    li      fp, %lo(adpcma_state) + 96
+    li      fp, %lo(adpcma_state) + 160
     li      s7, 6
 a_chan:
     lhu     t9, 10(v1)              /* nsamp */
@@ -619,9 +748,36 @@ a_chan_next:
     bnez    s7, a_chan
     addiu   fp, fp, 48              /* (delay slot) */
 
-    /* state back (the staged bytes are not changed) */
-    lw      s0, %lo(rdram_astate)
-    li      s4, %lo(adpcma_state)
+    jal     ssg_render
+    nop
+
+    /* dynamic state back: ADPCM-A decoders, SSG */
+    li      v1, %lo(adpcma_state)
+    li      t6, %lo(mix_dyn)
+    li      fp, 6
+a_unmerge:
+    lw      t0, 0(v1)
+    sw      t0, 0(t6)
+    lw      t0, 4(v1)
+    sw      t0, 4(t6)
+    addiu   v1, v1, 16
+    addiu   fp, fp, -1
+    bnez    fp, a_unmerge
+    addiu   t6, t6, 8
+    li      v1, %lo(adpcma_state) + 96
+    li      t6, %lo(mix_dyn) + 48
+    li      fp, 8
+s_unmerge:
+    lw      t0, 0(v1)
+    sw      t0, 0(t6)
+    addiu   v1, v1, 4
+    addiu   fp, fp, -1
+    bnez    fp, s_unmerge
+    addiu   t6, t6, 4
+    lw      t0, %lo(adpcma_state) + 96 + 52
+    sw      t0, %lo(mix_dyn) + 80
+    lw      s0, %lo(rdram_mixdyn)
+    li      s4, %lo(mix_dyn)
     li      t0, DMA_SIZE(96, 1)
     jal     DMAOut
     nop
@@ -632,4 +788,300 @@ a_chan_next:
     jal     DMAOut
     nop
     jr      v0
+    nop
+
+    ##############################################
+    # ssg_render: SSG generator per sample (mirrors ssg_model() in
+    # sound/ym2610_intf.c), adding 2 * sample to both lanes of work_out.
+    # k1 = num_samples.  Destroys everything except v0, k1, gp.
+    #
+    #   s0..s2 tone counters  s3..s5 tone periods  s6 noise cnt  s7 noise period
+    #   a0 env cnt  a1 env period  a2 LFSR  a3 env state  fp DC  t3 tick, then envelope volume
+    #   v1 bits: 0..2 tone outputs, 3 noise output   t9 samples left  k0 out
+    ##############################################
+ssg_render:
+    lbu     t0, %lo(adpcma_state + 96 + 61)          /* active */
+    beqz    t0, ssg_done
+    nop
+    sw      ra, %lo(ssg_tmp_ra)
+    /* envelope shape constants */
+    lbu     t0, %lo(adpcma_state + 96 + 60)          /* shape */
+    andi    t1, t0, 1                    /* hold */
+    srl     t2, t0, 3
+    andi    t2, t2, 1                    /* cont */
+    xori    t3, t2, 1
+    or      t1, t1, t3                   /* held = hold | !cont */
+    sb      t1, %lo(ssg_tmp + 0)
+    srl     t3, t0, 2
+    andi    t3, t3, 1                    /* att0 */
+    sb      t3, %lo(ssg_tmp + 2)
+    srl     t4, t0, 1
+    andi    t4, t4, 1                    /* alt */
+    sb      t4, %lo(ssg_tmp + 3)
+    xor     t5, t3, t4
+    and     t5, t5, t2
+    beqz    t5, ssg_em0
+    li      t6, 0
+    li      t6, 31
+ssg_em0:
+    sb      t6, %lo(ssg_tmp + 1)         /* envmax */
+
+    lw      s0, %lo(adpcma_state + 96 + 0)
+    lw      s1, %lo(adpcma_state + 96 + 4)
+    lw      s2, %lo(adpcma_state + 96 + 8)
+    lw      s6, %lo(adpcma_state + 96 + 12)
+    lw      a0, %lo(adpcma_state + 96 + 16)
+    lw      a2, %lo(adpcma_state + 96 + 20)
+    lw      a3, %lo(adpcma_state + 96 + 24)
+    lw      fp, %lo(adpcma_state + 96 + 28)
+    lw      s3, %lo(adpcma_state + 96 + 32)
+    lw      s4, %lo(adpcma_state + 96 + 36)
+    lw      s5, %lo(adpcma_state + 96 + 40)
+    lw      s7, %lo(adpcma_state + 96 + 44)
+    lw      a1, %lo(adpcma_state + 96 + 48)
+    lbu     t0, %lo(adpcma_state + 96 + 52)
+    lbu     t1, %lo(adpcma_state + 96 + 53)
+    sll     t1, t1, 1
+    or      v1, t0, t1
+    lbu     t1, %lo(adpcma_state + 96 + 54)
+    sll     t1, t1, 2
+    or      v1, v1, t1
+    lbu     t1, %lo(adpcma_state + 96 + 55)
+    sll     t1, t1, 3
+    or      v1, v1, t1
+    move    t9, k1
+    li      k0, %lo(work_out)
+
+ssg_samp:
+    lw      t3, %lo(ssg_tick)            /* SSG_TICKS_Q16 (t3 is free until the mix) */
+    /* ---- tones ---- */
+    addu    s0, s0, t3
+ssg_t0:
+    sltu    t0, s0, s3
+    bnez    t0, ssg_t0d
+    nop
+    subu    s0, s0, s3
+    b       ssg_t0
+    xori    v1, v1, 1
+ssg_t0d:
+    addu    s1, s1, t3
+ssg_t1:
+    sltu    t0, s1, s4
+    bnez    t0, ssg_t1d
+    nop
+    subu    s1, s1, s4
+    b       ssg_t1
+    xori    v1, v1, 2
+ssg_t1d:
+    addu    s2, s2, t3
+ssg_t2:
+    sltu    t0, s2, s5
+    bnez    t0, ssg_t2d
+    nop
+    subu    s2, s2, s5
+    b       ssg_t2
+    xori    v1, v1, 4
+ssg_t2d:
+    /* ---- noise: 17-bit LFSR, taps 0 and 3 ---- */
+    addu    s6, s6, t3
+ssg_n:
+    sltu    t0, s6, s7
+    bnez    t0, ssg_nd
+    nop
+    subu    s6, s6, s7
+    srl     t1, a2, 3
+    xor     t1, t1, a2
+    andi    t1, t1, 1
+    srl     a2, a2, 1
+    sll     t1, t1, 16
+    or      a2, a2, t1
+    andi    t1, a2, 1
+    sll     t1, t1, 3
+    andi    v1, v1, 7
+    b       ssg_n
+    or      v1, v1, t1
+ssg_nd:
+    /* ---- envelope ---- */
+    addu    a0, a0, t3
+ssg_e:
+    sltu    t0, a0, a1
+    bnez    t0, ssg_ed
+    nop
+    subu    a0, a0, a1
+    lbu     t8, %lo(ssg_tmp + 0)         /* held */
+    beqz    t8, ssg_einc
+    slti    t0, a3, 32
+    bnez    t0, ssg_einc
+    nop
+    b       ssg_e
+    li      a3, 32
+ssg_einc:
+    addiu   a3, a3, 1
+    b       ssg_e
+    andi    a3, a3, 63
+ssg_ed:
+    /* ---- mix ---- */
+    move    t2, zero                     /* mix */
+    li      t3, -1                       /* envelope volume, computed on first use */
+    lbu     t4, %lo(adpcma_state + 96 + 59)          /* mixer register */
+    srl     t8, v1, 3                    /* noise output */
+    srl     t5, v1, 0
+    srl     t6, t4, 0
+    or      t5, t5, t6
+    srl     t6, t4, 3
+    or      t6, t6, t8
+    and     t5, t5, t6
+    andi    t5, t5, 1
+    beqz    t5, ssg_skip0
+    nop
+    lbu     t6, %lo(adpcma_state + 96 + 56)   /* volume register */
+    andi    t7, t6, 0x10
+    beqz    t7, ssg_fix0
+    nop
+    jal     ssg_envvol
+    nop
+    b       ssg_add0
+    move    t6, t3
+ssg_fix0:
+    andi    t6, t6, 15
+    sll     t6, t6, 1
+    beqz    t6, ssg_add0
+    nop
+    ori     t6, t6, 1
+ssg_add0:
+    sll     t6, t6, 1
+    lh      t7, %lo(ssg_amp)(t6)
+    addu    t2, t2, t7
+ssg_skip0:
+    srl     t5, v1, 1
+    srl     t6, t4, 1
+    or      t5, t5, t6
+    srl     t6, t4, 4
+    or      t6, t6, t8
+    and     t5, t5, t6
+    andi    t5, t5, 1
+    beqz    t5, ssg_skip1
+    nop
+    lbu     t6, %lo(adpcma_state + 96 + 57)   /* volume register */
+    andi    t7, t6, 0x10
+    beqz    t7, ssg_fix1
+    nop
+    jal     ssg_envvol
+    nop
+    b       ssg_add1
+    move    t6, t3
+ssg_fix1:
+    andi    t6, t6, 15
+    sll     t6, t6, 1
+    beqz    t6, ssg_add1
+    nop
+    ori     t6, t6, 1
+ssg_add1:
+    sll     t6, t6, 1
+    lh      t7, %lo(ssg_amp)(t6)
+    addu    t2, t2, t7
+ssg_skip1:
+    srl     t5, v1, 2
+    srl     t6, t4, 2
+    or      t5, t5, t6
+    srl     t6, t4, 5
+    or      t6, t6, t8
+    and     t5, t5, t6
+    andi    t5, t5, 1
+    beqz    t5, ssg_skip2
+    nop
+    lbu     t6, %lo(adpcma_state + 96 + 58)   /* volume register */
+    andi    t7, t6, 0x10
+    beqz    t7, ssg_fix2
+    nop
+    jal     ssg_envvol
+    nop
+    b       ssg_add2
+    move    t6, t3
+ssg_fix2:
+    andi    t6, t6, 15
+    sll     t6, t6, 1
+    beqz    t6, ssg_add2
+    nop
+    ori     t6, t6, 1
+ssg_add2:
+    sll     t6, t6, 1
+    lh      t7, %lo(ssg_amp)(t6)
+    addu    t2, t2, t7
+ssg_skip2:
+    /* mix = mix * 73 >> 8 */
+    sll     t5, t2, 6
+    sll     t6, t2, 3
+    addu    t5, t5, t6
+    addu    t5, t5, t2
+    sra     t2, t5, 8
+    /* DC blocker: dc += ((mix << 8) - dc) >> 9; out = mix - ((dc + 128) >> 8) */
+    sll     t5, t2, 8
+    subu    t5, t5, fp
+    sra     t5, t5, 9
+    addu    fp, fp, t5
+    addiu   t5, fp, 128
+    sra     t5, t5, 8
+    subu    t5, t2, t5
+    sll     t5, t5, 1                    /* x2: see rsp_fm.h */
+    lw      t6, 0(k0)
+    addu    t6, t6, t5
+    sw      t6, 0(k0)
+    lw      t6, 4(k0)
+    addu    t6, t6, t5
+    sw      t6, 4(k0)
+    addiu   t9, t9, -1
+    bnez    t9, ssg_samp
+    addiu   k0, k0, 8
+
+    sw      s0, %lo(adpcma_state + 96 + 0)
+    sw      s1, %lo(adpcma_state + 96 + 4)
+    sw      s2, %lo(adpcma_state + 96 + 8)
+    sw      s6, %lo(adpcma_state + 96 + 12)
+    sw      a0, %lo(adpcma_state + 96 + 16)
+    sw      a2, %lo(adpcma_state + 96 + 20)
+    sw      a3, %lo(adpcma_state + 96 + 24)
+    sw      fp, %lo(adpcma_state + 96 + 28)
+    andi    t0, v1, 1
+    sb      t0, %lo(adpcma_state + 96 + 52)
+    srl     t0, v1, 1
+    andi    t0, t0, 1
+    sb      t0, %lo(adpcma_state + 96 + 53)
+    srl     t0, v1, 2
+    andi    t0, t0, 1
+    sb      t0, %lo(adpcma_state + 96 + 54)
+    srl     t0, v1, 3
+    sb      t0, %lo(adpcma_state + 96 + 55)
+    lw      ra, %lo(ssg_tmp_ra)
+ssg_done:
+    jr      ra
+    nop
+
+    /* t3 = envelope volume (computed once per sample; may clamp a3 to 32).
+     * Uses t0, t7. */
+ssg_envvol:
+    bgez    t3, ssg_ev_ret
+    nop
+    lbu     t0, %lo(ssg_tmp + 0)         /* held */
+    beqz    t0, ssg_ev_ramp
+    slti    t7, a3, 32
+    bnez    t7, ssg_ev_ramp
+    nop
+    li      a3, 32
+    b       ssg_ev_ret
+    lbu     t3, %lo(ssg_tmp + 1)         /* envmax */
+ssg_ev_ramp:
+    lbu     t0, %lo(ssg_tmp + 2)         /* att */
+    lbu     t7, %lo(ssg_tmp + 3)         /* alt */
+    beqz    t7, ssg_ev_noalt
+    srl     t7, a3, 5
+    andi    t7, t7, 1
+    xor     t0, t0, t7
+ssg_ev_noalt:
+    andi    t3, a3, 31
+    bnez    t0, ssg_ev_ret
+    nop
+    xori    t3, t3, 31
+ssg_ev_ret:
+    jr      ra
     nop

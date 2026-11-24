@@ -25,8 +25,8 @@ DEFINE_RSP_UCODE(rsp_fm);
 static uint32_t fm_ovl_id;
 static int tables_uploaded = 0;
 
-static uint16_t rsp_sin_tab[256] __attribute__((aligned(16)));
-static uint16_t rsp_exp_tab[256] __attribute__((aligned(16)));
+uint16_t rsp_sin_tab[256] __attribute__((aligned(16)));   /* also read by FM_VERIFY builds */
+uint16_t rsp_exp_tab[256] __attribute__((aligned(16)));
 
 enum {
 	CMD_FM_RENDER = 0,
@@ -105,59 +105,59 @@ static void upload_tables(void)
 
 /* Not the high-priority queue: audio jumping ahead of the video's RSP work
  * lowered the CPU's wait here but delayed frames (ares: 43.7 -> 29.4 FPS). */
-static rspq_syncpoint_t fm_sync;
+static rspq_syncpoint_t audio_sync;
 
-/* Queue one FM render and return at once (rsp_adpcma_render queues the
- * ADPCM-A part and the syncpoint); rsp_fm_wait() blocks until the RSP
- * has written the state and the samples back.
- *
- * The syncpoint is queued in the same batch as the render.  (Appending it
- * later, as rspq_wait() does, means waking an RSP that has just gone to sleep
- * after the render: that wake-up can be lost, and rspq_wait() then times out
- * with an RSP crash screen.  rspq_wait() would also wait for the RDP to finish
- * drawing, which the audio does not need.)
- *
- * The RSP writes both buffers with DMA, so the CPU must hold no cached copy
- * of them: the state is flushed and dropped here, the output lines are
- * dropped here too, and the caller does not touch either until rsp_fm_wait(). */
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf)
+/* Drop the CPU's cached copies of a buffer the RSP will write with DMA. */
+static void drop_cache(void *p, int bytes)
 {
-	upload_tables();
-
-	data_cache_hit_writeback_invalidate(state, (sizeof(*state) + 15) & ~15);
-	{
-		uintptr_t a = (uintptr_t)out_buf & ~(uintptr_t)15;
-		uintptr_t b = ((uintptr_t)(out_buf + 2 * state->num_samples) + 15) & ~(uintptr_t)15;
-		data_cache_hit_invalidate((void *)a, b - a);
-	}
-
-	rspq_write(fm_ovl_id, CMD_FM_RENDER,
-		   state->num_samples,
-		   PhysicalAddr(state),
-		   PhysicalAddr(out_buf));
+	uintptr_t a = (uintptr_t)p & ~(uintptr_t)15;
+	uintptr_t b = ((uintptr_t)p + bytes + 15) & ~(uintptr_t)15;
+	data_cache_hit_invalidate((void *)a, b - a);
 }
 
-/* Queue ADPCM-A for the chunk just queued by rsp_fm_render, then the
- * syncpoint that rsp_fm_wait() waits for (one wait covers both). */
-void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf)
+/* Queue the FM part of one chunk.  The RSP reads the parameter snapshot and
+ * the dynamic state, renders, and writes the dynamic state and the samples
+ * back.  Nothing is waited for: see rsp_audio_kick / rsp_audio_wait. */
+void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn, int32_t *out_buf)
 {
-	data_cache_hit_writeback_invalidate(state, (sizeof(*state) + 15) & ~15);
-	{
-		uintptr_t a = (uintptr_t)out_buf & ~(uintptr_t)15;
-		uintptr_t b = ((uintptr_t)(out_buf + 2 * n) + 15) & ~(uintptr_t)15;
-		data_cache_hit_invalidate((void *)a, b - a);
-	}
-	rspq_write(fm_ovl_id, CMD_ADPCMA_RENDER, n, PhysicalAddr(state), PhysicalAddr(out_buf));
-	fm_sync = rspq_syncpoint_new();
+	upload_tables();
+	data_cache_hit_writeback(params, (sizeof(*params) + 15) & ~15);
+	drop_cache(out_buf, params->num_samples * 8);
+	rspq_write(fm_ovl_id, CMD_FM_RENDER, params->num_samples, PhysicalAddr(params),
+		   PhysicalAddr(out_buf), PhysicalAddr(dyn));
+}
+
+/* Queue ADPCM-A + SSG for the same chunk. */
+void rsp_adpcma_render(struct rsp_adpcma_state *params, struct rsp_mix_dyn *dyn, int n, int32_t *out_buf)
+{
+	data_cache_hit_writeback(params, (sizeof(*params) + 15) & ~15);
+	drop_cache(out_buf, n * 8);
+	rspq_write(fm_ovl_id, CMD_ADPCMA_RENDER, n, PhysicalAddr(params), PhysicalAddr(out_buf), PhysicalAddr(dyn));
+}
+
+/* After a batch: one syncpoint, queued with it (a syncpoint queued later,
+ * as rspq_wait() does, could hang the queue in ares), and start the RSP. */
+void rsp_audio_kick(void)
+{
+	audio_sync = rspq_syncpoint_new();
 	rspq_flush();
 }
 
-void rsp_fm_wait(void)
+void rsp_audio_wait(void)
 {
-	rspq_syncpoint_wait(fm_sync);
+	rspq_syncpoint_wait(audio_sync);
+}
+
+/* The dynamic state lives in RDRAM and is only touched by the RSP after
+ * this: write back the CPU's initial values and drop its cached copy. */
+void rsp_audio_init_dyn(void *dyn, int bytes)
+{
+	data_cache_hit_writeback_invalidate(dyn, (bytes + 15) & ~15);
 }
 #else
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf) {}
-void rsp_fm_wait(void) {}
-void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf) {}
+void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn, int32_t *out_buf) {}
+void rsp_adpcma_render(struct rsp_adpcma_state *params, struct rsp_mix_dyn *dyn, int n, int32_t *out_buf) {}
+void rsp_audio_kick(void) {}
+void rsp_audio_wait(void) {}
+void rsp_audio_init_dyn(void *dyn, int bytes) {}
 #endif

@@ -69,6 +69,8 @@ uint8_t sound_result(void);
  * Fills output buffer with 16-bit stereo PCM.
  * Returns number of samples generated. */
 int sound_render(int16_t *buf, int max_samples);
+void sound_render_issue(int max_samples);   /* queue (RSP work is asynchronous) */
+void sound_render_finish(int16_t *buf);     /* wait for it and mix into buf */
 
 /* Dump diagnostic counters (command count, register writes, etc.) */
 void sound_debug_stats(void);

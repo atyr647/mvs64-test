@@ -44,9 +44,16 @@ struct rsp_fm_chan {
 struct rsp_fm_state {
 	struct rsp_fm_chan ch[YM2610_FM_CHANNELS];  /* 224 bytes */
 	uint16_t num_samples;
-	uint16_t pad;
+	uint16_t reset;         /* bit 4*ch+op: restart that operator's phase (key-on) */
 	uint32_t pad2;          /* RSP DMA moves multiples of 8 bytes: 228 -> 232 */
 }; /* 232 bytes */
+
+/* State the RSP carries from chunk to chunk (persistent in RDRAM; the CPU
+ * only initialises it).  Each render command gets a snapshot of the
+ * parameters above and merges this in: phase / op1_out / mem per channel. */
+struct rsp_fm_dyn {
+	struct { uint32_t phase[4]; int32_t op1_out, mem; } ch[4];   /* 96 bytes */
+};
 
 void rsp_fm_init(void);
 /* ---- ADPCM-A on the RSP ----
@@ -54,7 +61,9 @@ void rsp_fm_init(void);
  * per render chunk it stages each channel's compressed bytes and says how
  * many samples to produce.  The RSP decodes, resamples (18.5 kHz -> 22.05
  * kHz, linear) and applies the volume, writing the per-sample L and R sums
- * (int32, before the x0.5 gain).  Layout is shared with rsp_fm.S. */
+ * (int32, before the x0.5 gain).  The SSG is added to both, x2 (the sums
+ * are multiples of 4, so (a + 2*ssg) >> 1 == a/2 + ssg exactly).
+ * Layout is shared with rsp_fm.S. */
 #define RSP_ADPCMA_BYTES 48           /* staged bytes per channel per chunk (<= 92 samples) */
 struct rsp_adpcma_chan {
 	int16_t  acc;      /* 12-bit decoder accumulator, 0..4095 */
@@ -63,14 +72,46 @@ struct rsp_adpcma_chan {
 	uint16_t frac;     /* resampling phase (Q16) */
 	uint16_t nsamp;    /* samples to produce this chunk (0 = channel idle) */
 	uint8_t  k0;       /* first nibble: 0 = high nibble of bytes[0], 1 = low */
-	uint8_t  out;      /* bit0 add to L, bit1 add to R (0 = decode only) */
+	uint8_t  out;      /* bit0 add to L, bit1 add to R (0 = decode only); bit7 key-on: reset the decoder */
 	uint8_t  mul;      /* volume multiplier 8..15 */
 	uint8_t  sh;       /* volume shift 5..12 */
 } __attribute__((packed));            /* 16 bytes */
+/* SSG generator state (the RSP runs it per sample unless the CPU found the
+ * chunk silent and advanced it in bulk).  The first 32 bytes are its state,
+ * the rest is staged from the registers each chunk. */
+struct rsp_ssg_state {
+	uint32_t cnt[3];       /*  0 tone counters (Q16) */
+	uint32_t noise_cnt;    /* 12 */
+	uint32_t env_cnt;      /* 16 */
+	uint32_t lfsr;         /* 20 17-bit noise LFSR */
+	uint32_t env_state;    /* 24 0..31 ramp, 32 held */
+	int32_t  dc;           /* 28 DC blocker (Q8) */
+	uint32_t thr[3];       /* 32 tone period << 16 */
+	uint32_t nthr, ethr;   /* 44, 48 noise / envelope period << 16 */
+	uint8_t  tone[3];      /* 52 */
+	uint8_t  noise_bit;    /* 55 */
+	uint8_t  vol[3];       /* 56 registers 8..10 */
+	uint8_t  mixer;        /* 59 register 7 */
+	uint8_t  shape;        /* 60 register 0xD */
+	uint8_t  active;       /* 61 (unused: always runs) */
+	uint8_t  restart;      /* 62 shape register written: restart the envelope */
+	uint8_t  pad;
+};                         /* 64 bytes */
+
+/* ADPCM-A decoder and SSG state carried from chunk to chunk by the RSP
+ * (merged into the struct below: acc/step/s0/s1 per channel, SSG bytes
+ * 0..31 and 52..55). */
+struct rsp_mix_dyn {
+	struct { int16_t acc, step, s0, s1; } a[6];   /*  48 bytes */
+	uint8_t ssg[36];                               /*  36 bytes: rsp_ssg_state 0..31, 52..55 */
+	uint8_t pad[12];
+};                                                 /*  96 bytes */
+
 struct rsp_adpcma_state {
 	struct rsp_adpcma_chan ch[6];                 /*  96 bytes */
+	struct rsp_ssg_state ssg;                     /*  64 bytes (also written back) */
 	uint8_t bytes[6][RSP_ADPCMA_BYTES];           /* 288 bytes */
-};                                                /* 384 bytes */
+};                                                /* 448 bytes */
 
 /* The RSP runs FM_OVERSAMPLE operator steps per output sample (incr[] is
  * per step) and sums them into the output, which removes most of the
@@ -78,9 +119,12 @@ struct rsp_adpcma_state {
 #define FM_OVERSAMPLE 2
 
 /* Renders state->num_samples (<= 128) stereo samples, int32 L,R interleaved. */
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);   /* asynchronous */
-/* queue ADPCM-A for the same chunk (call right after rsp_fm_render) */
-void rsp_adpcma_render(struct rsp_adpcma_state *state, int n, int32_t *out_buf);
-void rsp_fm_wait(void);                                              /* until that render is done */
+/* Queue one chunk (asynchronous): FM, then ADPCM-A + SSG.  The parameter
+ * snapshots must stay untouched until rsp_audio_wait(). */
+void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn, int32_t *out_buf);
+void rsp_adpcma_render(struct rsp_adpcma_state *params, struct rsp_mix_dyn *dyn, int n, int32_t *out_buf);
+void rsp_audio_kick(void);    /* after queueing a batch: syncpoint + start the RSP */
+void rsp_audio_wait(void);    /* until everything queued before the kick is done */
+void rsp_audio_init_dyn(void *dyn, int bytes);   /* after the CPU initialised a dynamic block */
 
 #endif
