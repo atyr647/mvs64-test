@@ -57,7 +57,13 @@ had kept 25 out-of-line copies of `m68k_read/write_memory_*`, called from
 every interpreter handler (11% of sampled CPU time). Real FPS over the same
 game frames: 43.9 -> 50.7 (frames 2400-6000), 39.0 -> 41.1 (6000-9000).
 Forcing the next level too (`m68ki_read/write_*_fc`, push/pull) went the
-other way: +266 KB of code, 50.7 -> 45.0 FPS.
+other way: +266 KB of code, 52.9 -> 46.5 FPS (frames 2400-4000).
+
+**Re-checked with real FPS** (`tools/prof/fps_by_frames.sh`, frames
+2400-4000): the profile-guided handler layout is worth 45.0 -> 52.9 FPS
+(the profiling build had shown 2%). Regenerating `m68kops_hot.txt` from a
+profile of the current build (most hot code now native) gave 44.7: no
+better than no layout, so the original list stays.
 
 Where a frame goes now (Stage 1, ares, `[XSUM]`): 68K 86%, sound 31%, draw
 11% (before the inlining change; profiling builds no longer represent the
