@@ -90,10 +90,10 @@ host builds run them, so the host suite checks them against ymfm.
 Verify builds run the models on the N64 next to the RSP and compare every
 batch bit for bit:
 
-* `SND_CFLAGS=-DADPCMA_VERIFY`: ADPCM-A + SSG outputs and RSP state
-  (`[AVERIFY] <n> batches, 0 mismatched`)
-* `SND_CFLAGS=-DFM_VERIFY`: FM outputs against `rspfm_model.h`'s model
-  (`[FMVERIFY]`)
+* `SND_CFLAGS=-DADPCMA_VERIFY` (or `-DFM_VERIFY`): FM, ADPCM-A and SSG
+  through their C models into the combined buffer, compared with the RSP's
+  output and all its dynamic state
+  (`[VERIFY] <n> batches, 0 mismatched`)
 
 ## Other switches
 

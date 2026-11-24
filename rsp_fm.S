@@ -520,15 +520,8 @@ fm_unmerge:
     jal     DMAOut
     nop
 
-    /* ---- DMA output to RDRAM ---- */
-    lw      s0, %lo(rdram_out)
-    li      s4, %lo(work_out)
-    sll     t0, k1, 3
-    addiu   t0, t0, 7
-    andi    t0, t0, 0xFFF8
-    addiu   t0, t0, -1
-    jal     DMAOut
-    nop
+    /* The FM sums stay in work_out: cmd_adpcma_render (always queued next)
+     * adds ADPCM-A and the SSG and writes the combined chunk out. */
 
     jr      v0
     nop
@@ -602,14 +595,7 @@ s_merge:
     sw      zero, %lo(adpcma_state) + 96 + 24
 s_norestart:
 
-    li      t3, %lo(work_out)
-    sll     t4, k1, 3
-    add     t5, t3, t4
-a_clear:
-    sw      zero, 0(t3)
-    addiu   t3, t3, 4
-    bne     t3, t5, a_clear
-    nop
+    /* work_out holds this chunk's FM sums (cmd_fm_render): add to them */
 
     li      v1, %lo(adpcma_state)
     li      fp, %lo(adpcma_state) + 160
@@ -719,6 +705,7 @@ a_v4:
     srav    t3, t3, a2
     li      t4, -4
     and     t3, t3, t4
+    sll     t3, t3, 2                    /* x4: FM scale, see rsp_fm.h */
     andi    t4, a0, 1
     beqz    t4, a_noL
     nop
@@ -792,7 +779,7 @@ s_unmerge:
 
     ##############################################
     # ssg_render: SSG generator per sample (mirrors ssg_model() in
-    # sound/ym2610_intf.c), adding 2 * sample to both lanes of work_out.
+    # sound/ym2610_intf.c), adding 8 * sample to both lanes of work_out.
     # k1 = num_samples.  Destroys everything except v0, k1, gp.
     #
     #   s0..s2 tone counters  s3..s5 tone periods  s6 noise cnt  s7 noise period
@@ -1023,7 +1010,7 @@ ssg_skip2:
     addiu   t5, fp, 128
     sra     t5, t5, 8
     subu    t5, t2, t5
-    sll     t5, t5, 1                    /* x2: see rsp_fm.h */
+    sll     t5, t5, 3                    /* x8: FM scale, see rsp_fm.h */
     lw      t6, 0(k0)
     addu    t6, t6, t5
     sw      t6, 0(k0)

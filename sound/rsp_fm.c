@@ -118,13 +118,11 @@ static void drop_cache(void *p, int bytes)
 /* Queue the FM part of one chunk.  The RSP reads the parameter snapshot and
  * the dynamic state, renders, and writes the dynamic state and the samples
  * back.  Nothing is waited for: see rsp_audio_kick / rsp_audio_wait. */
-void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn, int32_t *out_buf)
+void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn)
 {
 	upload_tables();
 	data_cache_hit_writeback(params, (sizeof(*params) + 15) & ~15);
-	drop_cache(out_buf, params->num_samples * 8);
-	rspq_write(fm_ovl_id, CMD_FM_RENDER, params->num_samples, PhysicalAddr(params),
-		   PhysicalAddr(out_buf), PhysicalAddr(dyn));
+	rspq_write(fm_ovl_id, CMD_FM_RENDER, params->num_samples, PhysicalAddr(params), 0, PhysicalAddr(dyn));
 }
 
 /* Queue ADPCM-A + SSG for the same chunk. */
@@ -155,7 +153,7 @@ void rsp_audio_init_dyn(void *dyn, int bytes)
 	data_cache_hit_writeback_invalidate(dyn, (bytes + 15) & ~15);
 }
 #else
-void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn, int32_t *out_buf) {}
+void rsp_fm_render(struct rsp_fm_state *params, struct rsp_fm_dyn *dyn) {}
 void rsp_adpcma_render(struct rsp_adpcma_state *params, struct rsp_mix_dyn *dyn, int n, int32_t *out_buf) {}
 void rsp_audio_kick(void) {}
 void rsp_audio_wait(void) {}
