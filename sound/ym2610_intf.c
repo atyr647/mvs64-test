@@ -166,7 +166,7 @@ static uint8_t  cmd_log[256]; static uint32_t cmd_log_printed;
 static int32_t  stat_peak;           /* peak |sample| since last stats dump */
 static uint32_t stat_nonzero;
 static uint32_t stat_ssg_nonzero;
-static uint32_t prof_z80, prof_rsp, prof_mix, prof_ssg, prof_a, prof_b, prof_eg;
+static uint32_t prof_z80, prof_rsp, prof_mix, prof_ssg, prof_a, prof_b, prof_eg, prof_q, prof_fin;
 static uint32_t stat_ymq_full;   /* register-write queue overflows */
 #ifndef N64
 static int snd_host_mute;        /* host test harnesses only, see render_segment */
@@ -228,10 +228,11 @@ void sound_debug_stats(void)
 		debugf("[SND] peaks: fm=%ld ssg=%ld adpcmA=%ld adpcmB=%ld clipped=%lu\n",
 			(long)pk_fm, (long)pk_ssg, (long)pk_a, (long)pk_b, (unsigned long)stat_clipped);
 		pk_fm = pk_ssg = pk_a = pk_b = 0; stat_clipped = 0;
-		debugf("[SND] mix split: ssg=%.1f%% adpcmA=%.1f%% adpcmB=%.1f%% fm_env=%.1f%% other=%.1f%%\n",
+		debugf("[SND] mix split: ssg=%.1f%% adpcmA=%.1f%% adpcmB=%.1f%% fm_env=%.1f%% rspq=%.1f%% final=%.1f%% other=%.1f%%\n",
 			prof_ssg * 100.f / span, prof_a * 100.f / span, prof_b * 100.f / span, prof_eg * 100.f / span,
-			((int32_t)(prof_mix - prof_ssg - prof_a - prof_b - prof_eg)) * 100.f / span);
-		prof_z80 = prof_rsp = prof_mix = prof_ssg = prof_a = prof_b = prof_eg = 0;
+			prof_q * 100.f / span, prof_fin * 100.f / span,
+			((int32_t)(prof_mix - prof_ssg - prof_a - prof_b - prof_eg - prof_q - prof_fin)) * 100.f / span);
+		prof_z80 = prof_rsp = prof_mix = prof_ssg = prof_a = prof_b = prof_eg = prof_q = prof_fin = 0;
 	}
 	stat_peak = 0; stat_nonzero = 0; stat_ssg_nonzero = 0;
 	stat_adpcma_nonzero = 0; stat_adpcmb_nonzero = 0;
@@ -1957,6 +1958,7 @@ static void issue_chunk(int off, int n)
 	prof_a += TICKS_DISTANCE(e1, q1);     /* staging */
 	rsp_fm_render(&sl->fm, &fm_dyn);
 	rsp_adpcma_render(&sl->a, &mix_dyn, n, ao);    /* FM + 4*ADPCM-A + 8*SSG */
+	prof_q += TICKS_DISTANCE(q1, TICKS_READ());
 #ifdef AUDIO_VERIFY
 	{	/* the C models on CPU-side shadows of the RSP state, in the same order */
 		static struct rsp_fm_state t; memcpy(&t, &sl->fm, sizeof(t));
@@ -2094,6 +2096,7 @@ void sound_render_finish(int16_t *buf)
 		stat_clipped += clip; stat_nonzero += nz;
 	}
 #ifdef N64
+	prof_fin += TICKS_DISTANCE(t1, TICKS_READ());
 	prof_mix += TICKS_DISTANCE(t1, TICKS_READ());
 #endif
 
