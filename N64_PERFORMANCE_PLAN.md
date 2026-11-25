@@ -111,6 +111,25 @@ three layouts (CODE_PAD 0, 576, 1600) and judged by the mean:
 | VRAM ports ($3C0000/2/4) handled first in the slow write paths | 52.6 / 49.8 / 46.3 |
 | per-second `[SND]` statistics only with `-DSND_STATS` | 53.0 / 50.1 / 46.7 |
 
+**The dispatch loop and memory helpers (Nov 2026).** The loop is already
+~20 instructions per 68K instruction (one TLB-mapped opcode load, two table
+loads, PPC/PC/IR stores, the call, the cycle test) and the work-RAM path of
+a memory helper ~12; what they cost is cache misses. Heavy section, I-cache
+misses per frame: handlers 3830 (0.74 per interpreted instruction), other
+code 1630, AOT functions 1340, memory helpers 870, the loop 220. Work-RAM
+D-cache misses (~1030/frame) are spread evenly over the cache offsets:
+capacity, not a conflict that placement could fix. The AOT lookup runs ~1250
+times per frame for 91 hits; a 128-bit PC filter in front of the hash made
+no measurable difference (kept, harmless). Putting the memory helpers right
+after the loop (51.7 / 48.7 / 45.4, two layouts) or the AOT functions after
+the 48 hottest handlers (M68K_HOT_FIRST=48 HLE_SECTION_BASE=500) did not help,
+and both builds hung once each in `display_get` (RSP idle, the frame never
+shown) -- a timing-dependent hang that no earlier run (~370 logs) showed;
+not investigated yet. Removing a store per instruction (REG_PPC: read only
+by the branch-to-self idle check and exception frames) would save ~1% at
+most. What would cut this cost is interpreting fewer instructions or with
+less code: smaller handlers (e.g. lazily computed flags) or a working DRC.
+
 Also measured this way and rejected: skipping sprite tiles known to be
 transparent (50.2 / 47.1 / 43.5: slower), and 8x larger rspq command
 buffers (a rebuilt libdragon; no change).
