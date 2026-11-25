@@ -32,7 +32,14 @@ static uint8_t z80_rom[Z80_ROM_SIZE];
  * continue at $0000 as on the real Z80, not in whatever memory follows. */
 #define Z80_WRAP_BYTES  64
 static uint8_t z80_ram[Z80_RAM_SIZE + Z80_WRAP_BYTES];
-static cz80_struc z80_cpu;
+/* The Z80 core's state at a fixed D-cache offset (8 KB direct-mapped D-cache).
+ * Left to the linker it landed on offset 0x1e00, the line of the main loop's
+ * stack frame (0x807ffe00, the stack sits at the top of RAM): ~420 misses
+ * per frame in the heavy section. 0x1680-0x17ff is quiet in the miss
+ * profile (clear of the stack at 0x1a00-0x1fff, of the 64 KB-aligned buffers'
+ * starts at 0x000-0x1ff and of m68ki_hot at 0x800-0xe2f). */
+static struct { char pad[0x1680]; cz80_struc cpu; } z80_blk __attribute__((aligned(0x2000)));
+#define z80_cpu (z80_blk.cpu)
 
 /* Absolute Z80 time (cycles since boot), also valid inside Cz80_Exec: I/O
  * handlers use it to place register writes on the chip's sample grid. */
