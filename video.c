@@ -239,3 +239,13 @@ uint32_t video_palette_r(uint32_t address, int sz) {
 	address += PALETTE_RAM_BANK;
 	return PALETTE_RAM[address];
 }
+
+#ifdef CODE_PAD
+/* -DCODE_PAD=n: an unused n-byte function, for measuring how much a result
+ * depends on code placement. The VR4300 I-cache is 16 KB direct-mapped and
+ * shifting all later code by a few hundred bytes moves FPS by up to +-3%, so
+ * a change should be judged by its mean over several pads (0, 576, 1600). */
+#define CP_STR2(x) #x
+#define CP_STR(x) CP_STR2(x)
+__attribute__((used, noinline)) void code_pad_fn(void) { __asm__ volatile(".space " CP_STR(CODE_PAD)); }
+#endif
