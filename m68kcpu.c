@@ -975,7 +975,7 @@ extern unsigned long prof_insn, prof_hle, prof_skipcyc;
 #ifdef PROFILER_CALLS
 uint32_t prof_call[1024];
 #endif
-#if defined(PROFILER_OPS) || defined(PROFILER_PCS)
+#if defined(PROFILER_OPS) || defined(PROFILER_PCS) || defined(PROFILER_OPIDX)
 uint32_t prof_op_fn[2048], prof_op_cnt[2048]; int prof_op_on;
 #endif
 #ifdef PROFILER_DISP
@@ -1144,6 +1144,11 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 				while (prof_op_fn[h] != fn && prof_op_fn[h] != 0) h = (h + 1) & 2047;
 				prof_op_fn[h] = fn; prof_op_cnt[h]++;
 			}
+#endif
+#ifdef PROFILER_OPIDX
+			/* executed opcodes by the D-cache offset of their dispatch entry
+			 * in a flat 4-byte table: ((op >> 8) & 7, op & 0xff) */
+			if (prof_op_on) prof_op_cnt[((REG_IR >> 8) & 7) << 8 | (REG_IR & 0xff)]++;
 #endif
 #ifdef PROFILER_OPS
 			if (prof_op_on) {   /* per-handler execution counts, open-addressed by handler address */

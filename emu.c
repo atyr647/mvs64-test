@@ -367,7 +367,7 @@ int main(int argc, char *argv[]) {
 			/* Exact totals over emulated frames [XSUM_START, XSUM_END): comparable
 			 * between builds because AUTOPLAY input is frame-based. */
 			extern unsigned long prof_insn;
-			#if defined(PROFILER_OPS) || defined(PROFILER_PCS)
+			#if defined(PROFILER_OPS) || defined(PROFILER_PCS) || defined(PROFILER_OPIDX)
 			extern uint32_t prof_op_fn[2048], prof_op_cnt[2048]; extern int prof_op_on;
 			#else
 			int prof_op_on = 0; (void)prof_op_on;
@@ -419,6 +419,9 @@ int main(int argc, char *argv[]) {
 				  /* totals since boot, per instruction x1000 would be nicer but keep it simple: whole-run sums */
 				  debugf("[XDISP] dispatch cycles=%llu icache_miss=%llu dcache_miss=%llu\n", xp_disp.cyc - z.cyc, xp_disp.ic, xp_disp.dc);
 				  debugf("[XDISP] handlers cycles=%llu icache_miss=%llu dcache_miss=%llu\n", xp_hnd.cyc, xp_hnd.ic, xp_hnd.dc); }
+				#endif
+				#ifdef PROFILER_OPIDX
+				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFIDX] %x %lu\n", i, (unsigned long)prof_op_cnt[i]);
 				#endif
 				#ifdef PROFILER_OPS
 				for (int i = 0; i < 2048; i++) if (prof_op_cnt[i]) debugf("[PROFOP] %lx %lu\n", (unsigned long)prof_op_fn[i], (unsigned long)prof_op_cnt[i]);
