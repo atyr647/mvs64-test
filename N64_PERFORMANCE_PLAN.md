@@ -96,6 +96,25 @@ With music working in the whole run (frames 2400-4000 / 4000-6000 /
 | ADPCM-B into one int16 L,R buffer, no memset | 50.7 / 47.8 / 43.7 |
 | skip fully transparent fix tiles (S-ROM bitmap) | 52.3 / 49.0 / 45.1 |
 
+**Code placement still moves FPS by up to +-3%.** An unused 576-byte function
+(`-DCODE_PAD=576`, end of video.c) took the build above from 52.3 to 49.7;
+1600 bytes, to 51.5. Shifting static data does not (the hot data is pinned),
+but code is: a 16 KB direct-mapped I-cache and far more hot code than that.
+Giving the hot emulator and libdragon functions fixed places in the linker
+script, and aligning .rodata/.data to 8 KB, did not remove the spread and was
+worse on average, so it was dropped. From here on a change is measured over
+three layouts (CODE_PAD 0, 576, 1600) and judged by the mean:
+
+| Change | mean FPS (2400-4000 / 4000-6000 / 6000-9000) |
+|---|---|
+| baseline (fix-tile skip) | 51.1 / 48.0 / 44.2 |
+| VRAM ports ($3C0000/2/4) handled first in the slow write paths | 52.6 / 49.8 / 46.3 |
+| per-second `[SND]` statistics only with `-DSND_STATS` | 53.0 / 50.1 / 46.7 |
+
+Also measured this way and rejected: skipping sprite tiles known to be
+transparent (50.2 / 47.1 / 43.5: slower), and 8x larger rspq command
+buffers (a rebuilt libdragon; no change).
+
 How the targets were found: the miss profile (patched ares) by data and by
 D-cache offset. The stack sits at the top of RAM, so offsets 0x1a00-0x1fff
 always hold hot stack frames; the 64 KB-aligned buffers (WORK_RAM, BIOS,
@@ -111,12 +130,17 @@ sound code at -Os/-O2 (slower or within noise); a regenerated
 its order matters through I-cache conflicts); V-ROM reads by raw PI DMA
 instead of DragonFS (no change); skipping sprite tiles known to be
 transparent (about a quarter of the drawn tiles are; measured 2% slower,
-not understood yet).
+confirmed over three code layouts below).
 
 Where a heavy frame goes now (sampling profiler, frames 6000-9000):
 `m68k_execute` 16%, `m68ki_read_8_fc` 7%, `sound_render_issue` 7%,
 `write_hwio` 5%, `Cz80_Exec` 5%, `emu_render` 5%, waiting for a free rspq
-buffer (`rspq_next_buffer`, `__rsp_check_assert`) about 4%.
+buffer (`rspq_next_buffer`, `__rsp_check_assert`) about 4%. (That profile came
+from a -DPROFILER build, whose per-frame output inflates the debug-output
+cost; `-DPROFILER_SAMPLE` now works on its own, on a production build. There,
+the out-of-line 68K memory helpers `m68ki_read/write_*_fc` add up to ~15%,
+mostly work-RAM cache misses. Note that the sampler counts 128-byte buckets,
+so a small function can be charged for its neighbour's samples.)
 
 **Old text, before the correction:** the 52.9 FPS layout is fragile. Nearly every perturbation drops it to
 ~44-46 FPS: the interpreter at -O3 (44.8) or -Os (44.7), a regenerated hot
