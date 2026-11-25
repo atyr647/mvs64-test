@@ -134,6 +134,25 @@ measurements are meaningful again for builds that keep the layout.
 | + 9 more (aee6 71e0 5ec00 5f46a 5f28a 5ee3e 600e 5f402, BIOS c126b4) | 59.3 / 58.2 / 55.6 |
 | C-ROM cache 2560 -> 4096 tiles, S-ROM 512 -> 1024 | 59.3 / 58.4 / 56.3 |
 
+| + 4f2d8 (the entity loops' sub-call), re-coloured | 59.3 / 59.4 / 57.1 |
+
+4f2d8 changes the game's course from ~frame 7000 (interrupt timing, not a
+wrong result), so 6000-9000 compares slightly different content; 4000-6000
+(+1.6%) is exact.
+
+**Leaner handler ABI (HANDLER_ABI=1, tools/m68k_abi.py): exact, neutral.**
+Handlers take the opcode as an argument and return their cycles (bne.b 22 ->
+13 instructions). Game state identical to the default build at all 38
+checkpoints to frame 19000. Re-coloured: 59.4 / 59.4 / 57.1 vs 59.3 / 59.4 /
+57.1, so it stays off: ~9 instructions on ~4000 interpreted instructions a
+frame do not show next to the cache misses. Its first measurement (52 FPS
+heavy) exposed a placement hazard instead: m68ki_hle_check, a 4-byte global
+the annealer does not move, had landed on the cycle counter's D-cache line
+(121k misses + 111k writebacks per 30 traced frames). It now lives in
+m68ki_hot beside the counter. Other small hot globals (rom_pc_idle_skip,
+P_ROM, m68ki_initial_cycles) carry the same risk; a D-cache miss profile
+(tools/prof, or tools/layout's dcolor with ITERS=0) shows it at once.
+
 The light section now sits at the 60 FPS limiter. Rejected: inlining the
 work-RAM fast path of the memory helpers at every call site (re-coloured:
 55.8 heavy, slower; handlers grew more than the calls saved); ADPCM-B decode
