@@ -184,8 +184,17 @@ static uint32_t g_drawn;   /* frames actually drawn (adaptive frameskip skips th
 
 uint32_t emu_render(void *arg) {
 
+	#ifdef FB_CRC
+	/* -DFB_CRC: draw every 500th frame whatever the frameskip, and log a CRC
+	 * of the finished framebuffer, to check that a renderer change leaves
+	 * the picture identical (the game state does not depend on rendering) */
+	const int fb_force = (g_frame % 500 == 0);
+	#else
+	const int fb_force = 0;
+	#endif
+
 	#ifdef N64
-	if (CONFIG_FRAMESKIP_MODE == 2) {
+	if (CONFIG_FRAMESKIP_MODE == 2 && !fb_force) {
 		extern volatile int N64_FRAME;
 
 		/* Adaptive frameskip: baseline 1-in-3 (like fixed mode), but
@@ -233,6 +242,16 @@ uint32_t emu_render(void *arg) {
 	video_render();
 	plat_endframe();
 	XP_END(xp_draw);
+	#if defined(FB_CRC) && defined(N64)
+	if (fb_force) {
+		extern uint8_t *g_screen_ptr;
+		rdpq_fence(); rspq_wait();
+		const uint16_t *p = (const uint16_t *)UncachedAddr(g_screen_ptr);
+		uint32_t crc = 2166136261u;
+		for (int i = 0; i < 320 * 224; i++) crc = (crc ^ p[i]) * 16777619u;
+		debugf("[FBCRC] frame=%d crc=%08lx\n", (int)g_frame, (unsigned long)crc);
+	}
+	#endif
 
 	rom_next_frame();
 
