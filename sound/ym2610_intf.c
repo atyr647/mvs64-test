@@ -1203,8 +1203,11 @@ static void adpcmb_write(uint8_t regnum, uint8_t val)
 }
 
 /* Add n output samples of ADPCM-B into acc */
-static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
+/* Writes all n samples of out (L,R interleaved int16; zeros when silent): it is
+ * the only producer of that buffer, so nothing has to clear it first. */
+static void adpcmb_render(int16_t *out, int n)
 {
+	int i = 0;
 	if ((adpcmb_status & ADPCMB_ST_PLAYING) && !(adpcmb_reg[0] & 0x80)) {
 		/* stopped by register $10 (registers cannot change inside a render) */
 		adpcmb_clk_acc = (adpcmb_clk_acc + ADPCMB_CLK_Q16) & 0xFFFF;
@@ -1214,7 +1217,7 @@ static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
 		int left = (adpcmb_reg[1] & 0x80) != 0, right = (adpcmb_reg[1] & 0x40) != 0;
 		int32_t lvl = adpcmb_reg[0xB], hi = 0, lo = 0;
 		uint32_t dn = adpcmb_delta_n(), clk = adpcmb_clk_acc, pos = adpcmb_pos16;
-		for (int i = 0; i < n; i++) {
+		for (; i < n; i++) {
 			/* the 2-3 chip clocks of this output sample, batched: each adds
 			 * delta_n to the 16-bit position, and each overflow decodes one nibble */
 			clk += ADPCMB_CLK_Q16;
@@ -1229,13 +1232,13 @@ static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
 				pos = adpcmb_pos16;
 			}
 			if (ended) break;
-			if (!audible) continue;
+			if (!audible) { out[2 * i] = out[2 * i + 1] = 0; continue; }
 			/* linear interpolation; (acc-prev) < 2^17 and pos>>1 < 2^15 fit in 32 bits */
 			int32_t r = adpcmb_prev + (((adpcmb_acc - adpcmb_prev) * (int32_t)(pos >> 1)) >> 15);
 			r = ((r * lvl) >> 9) >> ADPCMA_GAIN_SHIFT;
 			hi = r > hi ? r : hi; lo = r < lo ? r : lo;
-			if (left)  acc[i] += r;
-			if (right) accR[i] += r;
+			out[2 * i]     = left  ? (int16_t)r : 0;   /* |r| < 8192 */
+			out[2 * i + 1] = right ? (int16_t)r : 0;
 		}
 		adpcmb_clk_acc = clk; adpcmb_pos16 = pos;
 		if (hi > pk_b) pk_b = hi;
@@ -1245,6 +1248,7 @@ static void adpcmb_render(int32_t *acc, int32_t *accR, int n)
 		/* idle: keep the 55.5 kHz clock phase running so key-on timing is exact */
 		adpcmb_clk_acc = (uint32_t)(((uint64_t)adpcmb_clk_acc + (uint64_t)n * ADPCMB_CLK_Q16) & 0xFFFF);
 	}
+	if (i < n) memset(out + 2 * i, 0, (size_t)(n - i) * 2 * sizeof(int16_t));   /* silent rest */
 	/* mirror the live EOS state into the visible flags (bit 6 tracks, bit 7 is seen) */
 	uint8_t live = (adpcmb_status & ADPCMB_ST_EOS) ? 0x40 : 0x00;
 	if ((live ^ ym_adpcm_status) & 0x40)
@@ -1929,7 +1933,7 @@ struct chunk_slot {
 static struct chunk_slot slots[SLOTS];
 static int slot_next;
 static int32_t adpcma_out_b[2 * BATCH_MAX] __attribute__((aligned(16)));   /* ADPCM-A + 2*SSG, L,R */
-static int32_t bmix[BATCH_MAX], bmixR[BATCH_MAX];                           /* ADPCM-B */
+static int16_t bmix[2 * BATCH_MAX] __attribute__((aligned(16)));            /* ADPCM-B, L,R */
 static int batch_n;
 
 static void issue_chunk(int off, int n)
@@ -1985,9 +1989,8 @@ static void issue_chunk(int off, int n)
 		mix_unmerge(&tmp, &verify_dyn);
 	}
 #endif
-	memset(bmix + off, 0, n * sizeof(int32_t)); memset(bmixR + off, 0, n * sizeof(int32_t));
 	uint32_t q2 = TICKS_READ();
-	adpcmb_render(bmix + off, bmixR + off, n);
+	adpcmb_render(bmix + 2 * off, n);
 	prof_b += TICKS_DISTANCE(q2, TICKS_READ());
 #else
 	/* host: the C models, exactly as the RSP runs them */
@@ -1997,9 +2000,8 @@ static void issue_chunk(int off, int n)
 	if (snd_host_mute & 2) memset(ao, 0, (size_t)n * 8);
 	ssg_model(&sl->a.ssg, n, (snd_host_mute & 1) ? NULL : ao);
 	mix_unmerge(&sl->a, &mix_dyn);
-	memset(bmix + off, 0, n * sizeof(int32_t)); memset(bmixR + off, 0, n * sizeof(int32_t));
-	static int32_t scr[EG_CHUNK], scrR[EG_CHUNK];
-	adpcmb_render((snd_host_mute & 2) ? scr : bmix + off, (snd_host_mute & 2) ? scrR : bmixR + off, n);
+	adpcmb_render(bmix + 2 * off, n);
+	if (snd_host_mute & 2) memset(bmix + 2 * off, 0, (size_t)n * 2 * sizeof(int16_t));
 #endif
 }
 
@@ -2090,7 +2092,7 @@ void sound_render_finish(int16_t *buf)
 			int32_t fl = adpcma_out_b[2 * i] >> FM_MIX_SHIFT, fr = adpcma_out_b[2 * i + 1] >> FM_MIX_SHIFT;
 			fhi = fl > fhi ? fl : fhi; flo = fl < flo ? fl : flo;
 			fhi = fr > fhi ? fr : fhi; flo = fr < flo ? fr : flo;
-			int32_t l = bmix[i] + fl, r = bmixR[i] + fr;
+			int32_t l = bmix[2 * i] + fl, r = bmix[2 * i + 1] + fr;
 			if (l > 32767) { l = 32767; clip++; } else if (l < -32768) { l = -32768; clip++; }
 			if (r > 32767) { r = 32767; clip++; } else if (r < -32768) { r = -32768; clip++; }
 			nz += (l | r) != 0;
