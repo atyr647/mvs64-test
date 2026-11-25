@@ -1015,7 +1015,6 @@ static inline void xn_begin(void) { xn_cyc -= xn_read(0); xn_ic -= xn_read(0x11)
 static inline void xn_end(void)   { xn_cyc += xn_read(0); xn_ic += xn_read(0x11); xn_dc += xn_read(0x21); }
 #endif
 #ifdef USE_HLE
-int m68ki_hle_check = 1;
 #endif
 #if defined(USE_HLE) && defined(HLE_VERIFY)
 /* -DHLE_VERIFY=0xPC: lockstep check of one AOT function. Each call runs the

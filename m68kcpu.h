@@ -1009,7 +1009,6 @@ typedef struct m68ki_cpu_core_s
 
 } m68ki_cpu_core;
 
-#ifndef M68K_RECOMPILER
 /* The interpreter's hottest data, in one block placed at a chosen D-cache
  * index. The VR4300 D-cache is 8 KB direct-mapped: the CPU struct and the
  * opcode table used to sit at cache offsets 0x000-0x3ff, the same lines as
@@ -1023,6 +1022,11 @@ typedef struct {
 	char pad[M68K_HOT_OFFSET];
 	m68ki_cpu_core cpu;
 	sint remaining_cycles;
+	/* next to the counter on purpose: read every instruction and written on
+	 * every jump, it ping-ponged with the counter's line when the linker put
+	 * it at the same D-cache offset (one build: heavy section 57 -> 52 FPS);
+	 * the layout annealer does not move 4-byte objects */
+	int hle_check;
 #ifdef M68K_ABI_DISPATCH
 	int (**dispatch[256])(unsigned int) __attribute__((aligned(16)));   /* opcode >> 8 -> 256 handlers */
 #else
@@ -1030,6 +1034,7 @@ typedef struct {
 #endif
 } m68ki_hot_t;
 extern m68ki_hot_t m68ki_hot;
+#ifndef M68K_RECOMPILER
 #define m68ki_cpu              (m68ki_hot.cpu)
 #define m68ki_remaining_cycles (m68ki_hot.remaining_cycles)
 #endif
@@ -1543,7 +1548,7 @@ static inline void m68ki_fake_pull_32(void)
  * jump, call, return and taken branch asks the dispatch loop to check the new
  * PC (see m68k_execute). */
 #ifdef USE_HLE
-extern int m68ki_hle_check;
+#define m68ki_hle_check (m68ki_hot.hle_check)
 #define M68K_HLE_FLOW() (m68ki_hle_check = 1)
 #else
 #define M68K_HLE_FLOW()
