@@ -38,7 +38,7 @@ ares_run() {   # $1 = rom, $2 = seconds, $3 = log, [$4 = raw audio capture]
   env DISPLAY=$DISP LIBGL_ALWAYS_SOFTWARE=1 "${audio[@]}" timeout "$2" "$ARES" --system "Nintendo 64" --no-file-prompt --fullscreen "${set[@]}" "$1" >"$3" 2>&1 || true
 }
 FAIL=0
-echo "== building ROMs"; build -DSND_SELFTEST "$W/selftest.z64"; build -DAUTOPLAY "$W/autoplay.z64"
+echo "== building ROMs"; build "-DSND_SELFTEST -DSND_STATS" "$W/selftest.z64"; build "-DAUTOPLAY -DSND_STATS" "$W/autoplay.z64"
 
 echo "== self-test ROM: FM jingle as rendered by the RSP"
 ares_run "$W/selftest.z64" 150 "$W/ares_selftest.log"

@@ -98,6 +98,8 @@ batch bit for bit:
 ## Other switches
 
 * `SND_CFLAGS=-DSND_DISABLE` turns the sound CPU off, for A/B performance runs.
+* `SND_CFLAGS=-DSND_STATS` prints the per-second `[SND]` lines described below
+  (the ares suite builds with it; other builds print only the FPS line).
 * `SND_CFLAGS=-DSOUND_DEBUG_MODE=3` plays a hardcoded FM tone through the RSP.
 * The `[SND]` debug lines (once per second) report command/NMI counts, register
   writes, per-source peaks and clipping, the AI underrun count, write-queue

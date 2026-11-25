@@ -374,10 +374,12 @@ int main(int argc, char *argv[]) {
 		if (g_frame == MISS_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
 		if (g_frame == MISS_END) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
 		#endif
-		#ifdef PROFILER
 		#ifdef PROFILER_SAMPLE
+		/* independent of -DPROFILER, so it can sample a production build
+		 * (whose per-frame debug output does not distort the profile) */
 		{ extern void prof_frame(int); prof_frame((int)g_frame); }
 		#endif
+		#ifdef PROFILER
 		#ifndef XSUM_START
 		#define XSUM_START 1500
 		#define XSUM_END   3000
@@ -490,7 +492,12 @@ int main(int argc, char *argv[]) {
 			debugf("FPS: %.1f drawn %.1f\n", (g_frame - fps_frame) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime),
 				(g_drawn - fps_drawn) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime));
 			fps_drawn = g_drawn;
+			#ifdef SND_STATS
+			/* several long lines a second: through the ISViewer they cost
+			 * ~2% of the CPU in ares, so only on request (the ares sound
+			 * tests build with it) */
 			sound_debug_stats();
+			#endif
 			fps_frame = g_frame;
 			fps_time = curtime;
 		}
