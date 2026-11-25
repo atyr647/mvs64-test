@@ -124,6 +124,34 @@ hot code. This also changes what is worth trying: AOT functions and other
 code that lost to I-cache conflicts before may win now, and single-layout
 measurements are meaningful again for builds that keep the layout.
 
+**After the layout (Nov 2026), mean of three layouts, frames 2400-4000 /
+4000-6000 / 6000-9000:**
+
+| Change | FPS |
+|---|---|
+| coloured layout | 58.3 / 56.0 / 52.7 |
+| + 7 AOT functions (4f238..4f2b0 loops, 5eebc, 5eb58, 53698), re-coloured | 59.2 / 58.0 / 54.9 |
+| + 9 more (aee6 71e0 5ec00 5f46a 5f28a 5ee3e 600e 5f402, BIOS c126b4) | 59.3 / 58.2 / 55.6 |
+| C-ROM cache 2560 -> 4096 tiles, S-ROM 512 -> 1024 | 59.3 / 58.4 / 56.3 |
+
+The light section now sits at the 60 FPS limiter. Rejected: inlining the
+work-RAM fast path of the memory helpers at every call site (re-coloured:
+55.8 heavy, slower; handlers grew more than the calls saved); ADPCM-B decode
+in registers plus a statistics-free mix (bit-identical, neutral: the cost is
+misses on RSP-written buffers); 8192-tile C-ROM cache (no 1 MB-aligned
+block left for the banked P-ROM). Interpreted 68K instructions in the heavy
+section: 5206 -> 3962 per frame; the largest remaining interpreted block is
+4f2d8 (out because its interrupt timing changes the game's course).
+
+Heavy-section profile now (sampler at 32-byte buckets; 128-byte buckets
+misattribute in a coloured layout): 68K 61% (handlers 16, memory helpers
+16, AOT code 15, dispatch 14), sound 15%, drawing 8%, waiting for the RSP
+4%, frame limiter 3% (the cap), cartridge DMA waits 2.7% before the cache
+change. What is left is structural: ADPCM-B and the final mix on the RSP
+(needs IMEM: rsp_fm.S is nearly full), batching the per-tile RSP commands
+into cached memory (uncached stores, which ares does not charge for), and a
+leaner handler ABI (opcode as argument, cycles returned; picodrive64 2-4%).
+
 Also from the other ports: a lost RSP wake-up (the RSP asleep with work
 queued, `PC:018 [halt broke sig5 sig6 sig7]`) is now recovered from the
 VBlank interrupt (gpsp64 had patched libdragon for the same race); the
