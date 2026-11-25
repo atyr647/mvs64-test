@@ -111,6 +111,26 @@ three layouts (CODE_PAD 0, 576, 1600) and judged by the mean:
 | VRAM ports ($3C0000/2/4) handled first in the slow write paths | 52.6 / 49.8 / 46.3 |
 | per-second `[SND]` statistics only with `-DSND_STATS` | 53.0 / 50.1 / 46.7 |
 
+**Cache-coloured layout (Nov 2026): +10-13%, and the layout lottery is
+gone.** Ported from picodrive64 (tools/layout, README there): exact
+I-fetch/data-access traces of 2x30 gameplay frames from a patched ares,
+simulated annealing of every hot section's I-cache colour and every hot data
+object's D-cache colour, and padding statements in mvs64.ld that pin them.
+Simulated misses -69% (I) and -11% (D+writebacks); measured, mean of three
+code layouts: 52.8 / 50.0 / 46.6 -> 58.3 / 56.0 / 52.7 FPS, the three within
+0.1 FPS of each other (+-3% before). Default for any ROM with a
+tools/layout/<rom>.ld; regenerate with tools/layout/regen.sh after changing
+hot code. This also changes what is worth trying: AOT functions and other
+code that lost to I-cache conflicts before may win now, and single-layout
+measurements are meaningful again for builds that keep the layout.
+
+Also from the other ports: a lost RSP wake-up (the RSP asleep with work
+queued, `PC:018 [halt broke sig5 sig6 sig7]`) is now recovered from the
+VBlank interrupt (gpsp64 had patched libdragon for the same race); the
+`cpu/drc` dynarec is picodrive64's, never worked there either and has
+correctness bugs (clobbered t0 after write calls, N flag of word ops,
+banked ROM compiled as NOPs), so it is not worth reviving as is.
+
 **The dispatch loop and memory helpers (Nov 2026).** The loop is already
 ~20 instructions per 68K instruction (one TLB-mapped opcode load, two table
 loads, PPC/PC/IR stores, the call, the cycle test) and the work-RAM path of
