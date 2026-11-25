@@ -8,6 +8,7 @@ set -e
 W=$(mkdir -p "$1" && cd "$1" && pwd); GAME=${2:-blazstar.zip}; ROMNAME=$(basename "${GAME%.zip}")
 : "${ARES:?set ARES to an ares built with tools/layout/ares-cachetrace.patch}"
 : "${BIOS:?set BIOS to the NeoGeo BIOS}"
+export N64_INST=${N64_INST:-/opt/libdragon}; export PATH="$N64_INST/bin:$PATH"
 REPO=$(cd "$(dirname "$0")/../.." && pwd); T=$REPO/tools/layout
 cd "$REPO"
 for start in 3000 6500; do
@@ -29,7 +30,7 @@ cat tr3000.i tr6500.i > all.i
 python3 "$T/map_data.py" t6500.map base.data
 # data objects; m68ki_hot and z80_blk are 8 KB-aligned wrappers whose padding
 # already pins their hot part, so they are not moved
-/opt/libdragon/bin/mips64-elf-nm -S -n t6500.elf | python3 -c "
+"$N64_INST/bin/mips64-elf-nm" -S -n t6500.elf | python3 -c "
 import sys
 for l in sys.stdin:
     p = l.split()

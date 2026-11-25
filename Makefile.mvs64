@@ -74,7 +74,12 @@ ifdef USE_HLE
 # tools/prof/autopick.py proposes a longer list from a profile; a 46-entry
 # list from it measured slower (I-cache) and changed the game state, so new
 # entries must be verified one by one with -DPROFILER_STATE.
-HLE_PCS = 4012 4096 41b8 4f920 3820 3878 4f0c6 11e6 1160
+# Added Nov 2026, once the cache-coloured layout made cold AOT code cheap
+# (it measured slower before): the four entity-table loops at 4f238..4f2b0,
+# 5eebc, 5eb58, 53698. Game state as the interpreter's except stack bytes
+# (interrupt timing). Their sub-call 4f2d8 changes the game's course through
+# interrupt timing (HLE_VERIFY: identical per call), so it stays out.
+HLE_PCS = 4012 4096 41b8 4f920 3820 3878 4f0c6 11e6 1160 4f238 4f260 4f288 4f2b0 5eebc 5eb58 53698
 # Extra entrypoints inside the functions above (see genhle.c, "@pc")
 HLE_ENTRIES = 3860
 # Unrolled runs (see genhle.c, "rPC"): the two VRAM upload tables, entered at a
