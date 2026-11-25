@@ -87,6 +87,37 @@ bytes now changes FPS by less than 0.4%.
 With music working in the whole run (frames 2400-4000 / 4000-6000 /
 6000-9000): 44.9 / 42.4 / 42.2 FPS before, 48.2 / 45.3 / 41.3 after.
 
+**Round 3 (honest baseline, all measured with music working):**
+
+| Change | FPS after (2400-4000 / 4000-6000 / 6000-9000) |
+|---|---|
+| start (hot block, sound fix) | 48.3 / 45.3 / 41.6 |
+| `z80_cpu` off the stack's D-cache line (0x1e00 -> 0x1680) | 49.6 / 46.8 / 42.7 |
+| ADPCM-B into one int16 L,R buffer, no memset | 50.7 / 47.8 / 43.7 |
+| skip fully transparent fix tiles (S-ROM bitmap) | 52.3 / 49.0 / 45.1 |
+
+How the targets were found: the miss profile (patched ares) by data and by
+D-cache offset. The stack sits at the top of RAM, so offsets 0x1a00-0x1fff
+always hold hot stack frames; the 64 KB-aligned buffers (WORK_RAM, BIOS,
+...) all start at offset 0. Data that is touched constantly should be
+placed at an offset away from both (an aligned wrapper struct with a pad).
+
+Tried and rejected (measured): a flat 8 KB-aligned opcode table instead of
+the malloc'd sub-tables (hot opcode groups then collide by construction:
+1367 misses/frame on the table, slower); the AOT lookup table copied next to
+the CPU state (no change); the generated AOT functions, the handlers or the
+sound code at -Os/-O2 (slower or within noise); a regenerated
+`m68kops_hot.txt` (45.5, same as no list; the committed list gives 48.2, so
+its order matters through I-cache conflicts); V-ROM reads by raw PI DMA
+instead of DragonFS (no change); skipping sprite tiles known to be
+transparent (about a quarter of the drawn tiles are; measured 2% slower,
+not understood yet).
+
+Where a heavy frame goes now (sampling profiler, frames 6000-9000):
+`m68k_execute` 16%, `m68ki_read_8_fc` 7%, `sound_render_issue` 7%,
+`write_hwio` 5%, `Cz80_Exec` 5%, `emu_render` 5%, waiting for a free rspq
+buffer (`rspq_next_buffer`, `__rsp_check_assert`) about 4%.
+
 **Old text, before the correction:** the 52.9 FPS layout is fragile. Nearly every perturbation drops it to
 ~44-46 FPS: the interpreter at -O3 (44.8) or -Os (44.7), a regenerated hot
 list (44.7), even adding a few instructions to `main` (45.3). Deliberate
