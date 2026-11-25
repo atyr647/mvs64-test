@@ -1217,9 +1217,6 @@ static void adpcmb_render(int16_t *out, int n)
 		int left = (adpcmb_reg[1] & 0x80) != 0, right = (adpcmb_reg[1] & 0x40) != 0;
 		int32_t lvl = adpcmb_reg[0xB], hi = 0, lo = 0;
 		uint32_t dn = adpcmb_delta_n(), clk = adpcmb_clk_acc, pos = adpcmb_pos16;
-		uint8_t nib = adpcmb_nibble, byte = adpcmb_byte;
-		uint32_t addr = adpcmb_addr, endaddr = ((adpcmb_end() + 1) << 8) - 1;
-		int32_t acc = adpcmb_acc, prev = adpcmb_prev, step = adpcmb_step;
 		for (; i < n; i++) {
 			/* the 2-3 chip clocks of this output sample, batched: each adds
 			 * delta_n to the 16-bit position, and each overflow decodes one nibble */
@@ -1229,56 +1226,21 @@ static void adpcmb_render(int16_t *out, int n)
 			pos = total & 0xFFFF;
 			int ended = 0;
 			if (total >> 16) {
-				/* adpcmb_nibble_step(), with the decoder state in registers:
-				 * the globals are only touched at the end of a byte that is
-				 * also the end of the sample (repeat or EOS), which is rare */
-				for (uint32_t m = total >> 16; m; m--) {
-					if (nib == 0) byte = (uint8_t)adpcmb_fetch(addr);
-					int data = (uint8_t)(byte << (4 * nib)) >> 4;
-					nib ^= 1;
-					if (nib == 0) {
-						if (addr == endaddr) {
-							adpcmb_nibble = nib; adpcmb_byte = byte; adpcmb_addr = addr;
-							adpcmb_acc = acc; adpcmb_prev = prev; adpcmb_step = step;
-							adpcmb_pos16 = pos;          /* a loop restart resets it */
-							if (adpcmb_reg[0] & 0x10) {  /* repeat */
-								adpcmb_load_start();
-							} else {                     /* done: raise EOS */
-								adpcmb_acc = adpcmb_prev = 0;
-								adpcmb_status = (adpcmb_status & ~ADPCMB_ST_PLAYING) | ADPCMB_ST_EOS;
-								acc = prev = 0; ended = 1; break;
-							}
-							nib = adpcmb_nibble; byte = adpcmb_byte; addr = adpcmb_addr;
-							acc = adpcmb_acc; prev = adpcmb_prev; step = adpcmb_step; pos = adpcmb_pos16;
-						} else {
-							addr = (addr + 1) & 0xFFFFFF;
-						}
-					}
-					prev = acc;
-					int d = (2 * (data & 7) + 1) * step / 8;
-					if (data & 8) d = -d;
-					acc += d;
-					if (acc > 32767) acc = 32767; else if (acc < -32768) acc = -32768;
-					static const uint8_t scale[8] = { 57, 57, 57, 57, 77, 102, 128, 153 };
-					step = (step * scale[data & 7]) / 64;
-					if (step < ADPCMB_STEP_MIN) step = ADPCMB_STEP_MIN;
-					else if (step > ADPCMB_STEP_MAX) step = ADPCMB_STEP_MAX;
-				}
+				adpcmb_pos16 = pos;                  /* a loop restart resets it */
+				for (uint32_t m = total >> 16; m; m--)
+					if (!adpcmb_nibble_step()) { ended = 1; break; }
+				pos = adpcmb_pos16;
 			}
 			if (ended) break;
 			if (!audible) { out[2 * i] = out[2 * i + 1] = 0; continue; }
 			/* linear interpolation; (acc-prev) < 2^17 and pos>>1 < 2^15 fit in 32 bits */
-			int32_t r = prev + (((acc - prev) * (int32_t)(pos >> 1)) >> 15);
+			int32_t r = adpcmb_prev + (((adpcmb_acc - adpcmb_prev) * (int32_t)(pos >> 1)) >> 15);
 			r = ((r * lvl) >> 9) >> ADPCMA_GAIN_SHIFT;
 			hi = r > hi ? r : hi; lo = r < lo ? r : lo;
 			out[2 * i]     = left  ? (int16_t)r : 0;   /* |r| < 8192 */
 			out[2 * i + 1] = right ? (int16_t)r : 0;
 		}
 		adpcmb_clk_acc = clk; adpcmb_pos16 = pos;
-		if (!(adpcmb_status & ADPCMB_ST_EOS) || (adpcmb_status & ADPCMB_ST_PLAYING)) {
-			adpcmb_nibble = nib; adpcmb_byte = byte; adpcmb_addr = addr;
-			adpcmb_acc = acc; adpcmb_prev = prev; adpcmb_step = step;
-		}
 		if (hi > pk_b) pk_b = hi;
 		if (-lo > pk_b) pk_b = -lo;
 		if (audible) stat_adpcmb_nonzero += n;
@@ -2123,16 +2085,6 @@ void sound_render_finish(int16_t *buf)
 	return;
 
 #else
-#if defined(N64) && !defined(SND_STATS)
-	/* the plain mix: the peak / clip / non-zero statistics below only feed the
-	 * [SND] lines, and cost a dozen instructions per sample */
-	for (int i = 0; i < nsamples; i++) {
-		int32_t l = bmix[2 * i] + (adpcma_out_b[2 * i] >> FM_MIX_SHIFT), r = bmix[2 * i + 1] + (adpcma_out_b[2 * i + 1] >> FM_MIX_SHIFT);
-		if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
-		if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-		buf[2 * i] = (int16_t)l; buf[2 * i + 1] = (int16_t)r;
-	}
-#else
 	{
 		/* (FM + 4*ADPCM-A + 8*SSG) / 8 + ADPCM-B, clamp, store */
 		int32_t fhi = 0, flo = 0, ohi = 0, olo = 0; uint32_t clip = 0, nz = 0;
@@ -2152,7 +2104,6 @@ void sound_render_finish(int16_t *buf)
 		stat_peak = ohi > stat_peak ? ohi : stat_peak; stat_peak = -olo > stat_peak ? -olo : stat_peak;
 		stat_clipped += clip; stat_nonzero += nz;
 	}
-#endif
 #ifdef N64
 	prof_fin += TICKS_DISTANCE(t1, TICKS_READ());
 	prof_mix += TICKS_DISTANCE(t1, TICKS_READ());
