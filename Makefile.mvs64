@@ -41,7 +41,19 @@ CFLAGS += -DUSE_FAME -I.
 # FAME is enormous; needs reduced optimization to avoid GCC memory issues
 $(BUILD_DIR)/cpu/fame/famec.o: CFLAGS += -g0 -O2 -fno-expensive-optimizations
 else
+# HANDLER_ABI=1: compile tools/m68k_abi.py's rewrite of the handlers (opcode
+# as argument, cycles returned) instead of m68kops.c itself; genhle still
+# reads m68kops.c.
+ifeq ($(HANDLER_ABI),1)
+src_68k = m68kcpu.c m68kops_abi.c
+CFLAGS += -DM68K_ABI_DISPATCH
+m68kops_abi.c: m68kops.c m68kops_layout.h tools/m68k_abi.py
+	python3 tools/m68k_abi.py m68kops.c m68kops_layout.h $@
+$(BUILD_DIR)/m68kops_abi.o: m68kops_abi.c
+$(BUILD_DIR)/m68kops_abi.o: CFLAGS += $(M68KOPS_OPT)
+else
 src_68k = m68kcpu.c m68kops.c
+endif
 # Musashi's generated opcode file is huge; keep at -O2
 M68KOPS_OPT ?= -O2
 $(BUILD_DIR)/m68kops.o: CFLAGS += $(M68KOPS_OPT)

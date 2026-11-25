@@ -16,3 +16,4 @@ hle_index.h
 __pycache__/
 mvs64.ld
 m68kops_layout.h
+m68kops_abi.c

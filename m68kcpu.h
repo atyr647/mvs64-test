@@ -1023,7 +1023,11 @@ typedef struct {
 	char pad[M68K_HOT_OFFSET];
 	m68ki_cpu_core cpu;
 	sint remaining_cycles;
+#ifdef M68K_ABI_DISPATCH
+	int (**dispatch[256])(unsigned int) __attribute__((aligned(16)));   /* opcode >> 8 -> 256 handlers */
+#else
 	void (**dispatch[256])(void) __attribute__((aligned(16)));   /* opcode >> 8 -> 256 handlers */
+#endif
 } m68ki_hot_t;
 extern m68ki_hot_t m68ki_hot;
 #define m68ki_cpu              (m68ki_hot.cpu)
@@ -1571,6 +1575,7 @@ static inline void m68ki_jump_vector(uint vector)
  * So far I've found no problems with not calling pc_changed for 8 or 16
  * bit branches.
  */
+#ifndef M68K_HANDLER_ABI
 static inline void m68ki_branch_8(uint offset)
 {
 	M68K_HLE_FLOW();
@@ -1598,6 +1603,16 @@ static inline void m68ki_branch_32(uint offset)
 	if (m68k_check_idle_skip(REG_PC))
 		m68k_consume_timeslice();
 }
+#else
+/* tools/m68k_abi.py's handlers count cycles in a local (__cyc) that the
+ * dispatch loop subtracts afterwards: the idle skip sets it to the counter's
+ * current value, so the result is exactly what m68k_consume_timeslice()
+ * (counter = 0) gave, plus whatever the handler uses after the branch. */
+#define M68KI_IDLE_CONSUME() (__cyc = m68ki_remaining_cycles)
+#define m68ki_branch_8(offset)  do { M68K_HLE_FLOW(); REG_PC += MAKE_INT_8(offset); if (m68k_check_idle_skip(REG_PC)) M68KI_IDLE_CONSUME(); } while (0)
+#define m68ki_branch_16(offset) do { M68K_HLE_FLOW(); REG_PC += MAKE_INT_16(offset); if (m68k_check_idle_skip(REG_PC)) M68KI_IDLE_CONSUME(); } while (0)
+#define m68ki_branch_32(offset) do { M68K_HLE_FLOW(); REG_PC += (offset); m68ki_pc_changed(REG_PC); if (m68k_check_idle_skip(REG_PC)) M68KI_IDLE_CONSUME(); } while (0)
+#endif
 
 /* ---------------------------- Status Register --------------------------- */
 

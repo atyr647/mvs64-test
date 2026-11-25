@@ -65,14 +65,26 @@ extern void m68ki_build_opcode_table(void);
  * we get much better cache locality: instructions with the same top byte
  * (same instruction type) share a 1KB sub-table that fits in just 64 cache
  * lines. Only the actively-used sub-tables need to be in D-cache at once. */
+#ifdef M68K_ABI_DISPATCH
+/* handlers from tools/m68k_abi.py: opcode as argument, cycles returned. The
+ * subtraction is a separate statement so that it follows the call (the
+ * handler's exceptions adjust the counter themselves). */
+typedef int (*m68k_handler_t)(uint);
+extern int (*m68ki_instruction_jump_table_abi[0x10000])(uint);
+#define M68K_JUMP_TABLE m68ki_instruction_jump_table_abi
+#define M68K_CALL(ir) do { uint __o = (ir); int __c = m68k_dispatch_l2[__o >> 8][__o & 0xFF](__o); m68ki_remaining_cycles -= __c; } while (0)
+#else
 typedef void (*m68k_handler_t)(void);
+#define M68K_JUMP_TABLE m68ki_instruction_jump_table
+#define M68K_CALL(ir) m68k_dispatch_l2[(ir) >> 8][(ir) & 0xFF]()
+#endif
 #define m68k_dispatch_l2 (m68ki_hot.dispatch)
 
 static void m68k_init_dispatch(void) {
 	for (int i = 0; i < 256; i++) {
 		m68k_dispatch_l2[i] = (m68k_handler_t *)malloc(256 * sizeof(m68k_handler_t));
 		memcpy(m68k_dispatch_l2[i],
-		       &m68ki_instruction_jump_table[i * 256],
+		       &M68K_JUMP_TABLE[i * 256],
 		       256 * sizeof(m68k_handler_t));
 	}
 }
@@ -1029,7 +1041,7 @@ static void hle_verify_call(const HLEFunc *hle)
 	int n = 0;
 	do {
 		REG_PPC = REG_PC; REG_IR = m68ki_read_imm_16();
-		m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF]();
+		M68K_CALL(REG_IR);
 		n++;
 	} while (n < 100000 && !(REG_PC == c1.pc && REG_A[7] == c1.dar[15] && GET_CYCLES() <= cyc1));
 	hv_calls++;
@@ -1160,7 +1172,7 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 #ifdef PROFILER_CALLS
 			{	/* record every BSR/JSR target: candidate entry points for the AOT list */
 				uint ir = REG_IR;
-				m68k_dispatch_l2[ir >> 8][ir & 0xFF]();
+				M68K_CALL(ir);
 				if ((ir & 0xFF00) == 0x6100 || (ir & 0xFFC0) == 0x4E80) {
 					uint32_t t = REG_PC, h = (t * 2654435761u) >> 22;
 					while (prof_call[h] != t && prof_call[h] != 0) h = (h + 1) & 1023;
@@ -1171,13 +1183,12 @@ M68K_HOT __attribute__((noinline)) int m68k_execute(int num_cycles)
 #endif
 #ifdef PROFILER_DISP
 			{	/* split the 68K cost: xp_disp = fetch + table lookup, xp_hnd = handler body */
-				void (*fn)(void) = m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF];
 				xp_end(&xp_disp); xp_begin(&xp_hnd);
-				fn();
+				M68K_CALL(REG_IR);
 				xp_end(&xp_hnd); xp_begin(&xp_disp);
 			}
 #else
-			m68k_dispatch_l2[REG_IR >> 8][REG_IR & 0xFF]();
+			M68K_CALL(REG_IR);
 #endif
 		} while(GET_CYCLES() > 0);
 
