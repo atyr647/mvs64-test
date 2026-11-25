@@ -153,6 +153,20 @@ m68ki_hot beside the counter. Other small hot globals (rom_pc_idle_skip,
 P_ROM, m68ki_initial_cycles) carry the same risk; a D-cache miss profile
 (tools/prof, or tools/layout's dcolor with ITERS=0) shows it at once.
 
+**Frameskip (Nov 2026).** The adaptive mode now draws every frame while on
+time (it never drew two in a row before): game 59.2 / 59.2 / 56.7 FPS, drawn
+44.6 / 39.7 / 31.9 per second (was 28.8 / 27.7 / 24.5). With frameskip off
+(-DCONFIG_FRAMESKIP_MODE=0) the game runs at 51.9 / 49.5 / 45.8 FPS. Heavy
+section with every frame drawn, share of a 60 Hz frame (profiling build):
+68K 63.5, draw 44.9, sound 19.2, total 128. Of the draw share about 18
+points are emu_render's own CPU work and 18 points are waits on the RSP
+(rspq_next_buffer), although the RSP is only 38% busy: the CPU issues a
+frame's sprite commands in a burst. 8x larger rspq buffers and a third
+framebuffer did not help (the wait moves elsewhere; +0.6-1.7%), so reaching
+60 without skipping needs the draw path made asynchronous (sprite list in
+our own buffer, one RSP command), a cheaper tile walk, and sound work moved
+off the CPU -- about 28 points in all.
+
 The light section now sits at the 60 FPS limiter. Rejected: inlining the
 work-RAM fast path of the memory helpers at every call site (re-coloured:
 55.8 heavy, slower; handlers grew more than the calls saved); ADPCM-B decode
