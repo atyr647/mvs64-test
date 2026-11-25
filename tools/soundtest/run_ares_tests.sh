@@ -28,7 +28,7 @@ DISP=:97; rm -f /tmp/.X97-lock; Xvfb $DISP -screen 0 1280x960x24 -ac -nolisten t
 trap 'kill $XPID 2>/dev/null || true' EXIT; sleep 2
 
 build() {   # $1 = SND_CFLAGS, $2 = output rom
-  ( cd "$REPO" && touch platform_n64.c sound/ym2610_intf.c sound/rsp_fm.c &&
+  ( cd "$REPO" && touch platform_n64.c emu.c sound/ym2610_intf.c sound/rsp_fm.c &&
     make -f Makefile.mvs64 USE_HLE=1 SND_CFLAGS="$1" BIOS="$BIOS" ROM="$GAME" -j"$(nproc)" >"$W/build_$(basename "$2").log" 2>&1 &&
     cp mvs64-$(basename "${GAME%.zip}").z64 "$2" )
 }
