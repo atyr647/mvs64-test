@@ -202,12 +202,16 @@ uint32_t emu_render(void *arg) {
 		 * Never skip MORE than 2 consecutive frames — heavy scenes stay
 		 * at a steady 20 FPS floor rather than dropping to 10-12 FPS. */
 		static int skip_count = 0;
+		#ifndef FRAMESKIP_MIN
+		#define FRAMESKIP_MIN 0
+		#endif
 
 		if (skip_count < 2) {
 			/* Baseline: always skip at least 2 frames (render 1 in 3).
 			 * But if we're ahead of real-time, render early. */
-			if (skip_count >= 1 && N64_FRAME <= g_frame) {
-				/* Ahead of real-time: render this frame (1 in 2) */
+			if (skip_count >= FRAMESKIP_MIN && N64_FRAME <= g_frame) {
+				/* On time: render this frame (FRAMESKIP_MIN 0: every frame
+				 * while the CPU keeps up; 1: at most every second) */
 				skip_count = 0;
 			} else {
 				skip_count++;
