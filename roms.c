@@ -64,8 +64,8 @@ static void rom_cache_init(void) {
 	// dramatically reduce cartridge DMA loads per frame.
 #ifdef N64
 	int have_exp = (get_memory_size() >= 8*1024*1024);
-	int srom_max = have_exp ? 512  : 256;
-	int crom_max = have_exp ? 2560 : 1280;
+	int srom_max = have_exp ? 1024 : 256;
+	int crom_max = have_exp ? 4096 : 1280;
 #else
 	int srom_max = 256;
 	int crom_max = 1280;
