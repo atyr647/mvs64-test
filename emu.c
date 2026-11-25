@@ -374,6 +374,19 @@ int main(int argc, char *argv[]) {
 		if (g_frame == MISS_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (5 << 6)" : : "r"(s)); }
 		if (g_frame == MISS_END) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (6 << 6)" : : "r"(s)); }
 		#endif
+		#ifdef CACHE_TRACE
+		/* Patched ares (picodrive64 tools/layout/ares-cachetrace.patch): exact
+		 * I-fetch-run / data-access traces over TRACE_FRAMES frames from
+		 * TRACE_START, input for the cache-colouring tools (tools/layout). */
+		#ifndef TRACE_START
+		#define TRACE_START 6500
+		#endif
+		#ifndef TRACE_FRAMES
+		#define TRACE_FRAMES 30
+		#endif
+		if (g_frame == TRACE_START) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (8 << 6)" : : "r"(s)); }
+		if (g_frame == TRACE_START + TRACE_FRAMES) { register int64_t s asm("t0") = 0; asm volatile(".word 0x42000028 | (8 << 20) | (9 << 6)" : : "r"(s)); debugf("[TRACE] done\n"); }
+		#endif
 		#ifdef PROFILER_SAMPLE
 		/* independent of -DPROFILER, so it can sample a production build
 		 * (whose per-frame debug output does not distort the profile) */

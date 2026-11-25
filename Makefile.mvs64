@@ -142,6 +142,13 @@ $(BUILD_DIR)/mvs64-${ROMNAME}.dfs: $(MVS_STAMP)
 mvs64-${ROMNAME}.z64: $(BUILD_DIR)/mvs64-${ROMNAME}.dfs
 mvs64-${ROMNAME}.z64: N64_ROM_TITLE="MVS64: ${ROMNAME}"
 $(BUILD_DIR)/mvs64-${ROMNAME}.elf: $(obj) mvs64.ld
+# LTO_SECTIONS=1: one section per function and data object in the final LTO
+# code generation too (it runs at link time, and n64.mk's link line passes no
+# compiler flags), so a cache-coloured layout can place each one.
+ifdef LTO_SECTIONS
+CFLAGS += -ffunction-sections -fdata-sections
+$(BUILD_DIR)/mvs64-${ROMNAME}.elf: CXX = $(N64_CXX) -ffunction-sections -fdata-sections
+endif
 
 mvsmakerom: $(obj_makerom)
 	@echo "    [LD] $@"
