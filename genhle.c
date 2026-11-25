@@ -673,10 +673,23 @@ struct { unsigned int key; bool value; } *extra_entries = NULL;
 	fprintf(out, "\tuint32_t (*func)(m68ki_cpu_core *, int *, uint32_t);\n");
 	fprintf(out, "} HLEFunc;\n\n");
 
+	/* A 128-bit filter on (pc >> 1) & 127, held in two 64-bit constants (no
+	 * memory access): the dispatch loop asks after every jump and for a few
+	 * instructions after each native call, ~14 times per hit, and most PCs
+	 * fail here before the hash probe (mult + table load). */
+	uint64_t filt[2] = {0, 0};
+	for (int i=0;i<hmlen(func_pcs);i++) {
+		uint32_t b = (func_pcs[i].key >> 1) & 127;
+		filt[b >> 6] |= 1ull << (b & 63);
+	}
 	fprintf(out, "static inline const HLEFunc* hle_get_func(uint32_t pc) {\n");
-	fprintf(out, "\textern const HLEFunc g_hle_funcs[];\n");
-	fprintf(out, "\tconst HLEFunc *f = &g_hle_funcs[((pc * %d) >> %d) & 0x%x];\n", ph_mul, ph_shift, ph_mask);
-	fprintf(out, "\tif (pc == f->pc) return f;\n");
+	fprintf(out, "\tuint32_t b = (pc >> 1) & 127;\n");
+	fprintf(out, "\tif (((b & 64 ? 0x%016llxull : 0x%016llxull) >> (b & 63)) & 1) {\n",
+		(unsigned long long)filt[1], (unsigned long long)filt[0]);
+	fprintf(out, "\t\textern const HLEFunc g_hle_funcs[];\n");
+	fprintf(out, "\t\tconst HLEFunc *f = &g_hle_funcs[((pc * %d) >> %d) & 0x%x];\n", ph_mul, ph_shift, ph_mask);
+	fprintf(out, "\t\tif (pc == f->pc) return f;\n");
+	fprintf(out, "\t}\n");
 	if (arrlen(runs)) fprintf(out, "\textern const HLEFunc g_hle_runs[];\n");
 	for (int i=0;i<arrlen(runs);i++)
 		fprintf(out, "\tif (pc - 0x%xu < 0x%xu && (pc - 0x%xu) %% %du == 0) return &g_hle_runs[%d];\n",
