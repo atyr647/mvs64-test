@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regenerate the cache-coloured layout for one ROM (see README.md).
-#   ARES=/path/to/ares-with-cachetrace BIOS=bios.rom tools/layout/regen.sh WORKDIR [ROM.zip]
+#   ARES=/path/to/ares-with-cachetrace BIOS=bios.rom [MAKEARGS='HLE_PCS=...'] tools/layout/regen.sh WORKDIR [ROM.zip]
 # Builds two trace ROMs (light section from frame 3000, heavy from 6500, 30
 # frames each), records exact cache traces in the patched ares, anneals I-cache
 # and D-cache positions, and writes tools/layout/<rom>.ld. ~35 min on 4 cores.
@@ -14,7 +14,7 @@ for start in 3000 6500; do
   rm -rf build/mvs64 hle_*.c hle_index.h m68kops_layout.h mvs64.ld
   # trace the plain layout: colours do not depend on where sections start
   make -f Makefile.mvs64 USE_HLE=1 LTO_SECTIONS=1 CACHE_LAYOUT= BIOS="$BIOS" ROM="$GAME" \
-       SND_CFLAGS="-DAUTOPLAY -DCACHE_TRACE -DTRACE_START=$start" -j"$(nproc)" > "$W/build$start.log" 2>&1
+       SND_CFLAGS="-DAUTOPLAY -DCACHE_TRACE -DTRACE_START=$start" $MAKEARGS -j"$(nproc)" > "$W/build$start.log" 2>&1
   cp mvs64-"$ROMNAME".z64 "$W/t$start.z64"; cp build/mvs64/mvs64-"$ROMNAME".map "$W/t$start.map"
   cp build/mvs64/mvs64-"$ROMNAME".elf "$W/t$start.elf"
 done
