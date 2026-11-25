@@ -19,6 +19,7 @@ void rom_load_prom(const char *dir);
 
 uint8_t* crom_get_sprite(int spritenum);
 uint8_t* srom_get_sprite(int spritenum);
+_Bool srom_tile_blank(int spritenum);   /* all pixels transparent */
 
 void srom_set_bank(int bank);  // 0 = fixed (BIOS), 1 = game
 

@@ -74,6 +74,40 @@ static void rom_cache_init(void) {
 	sprite_cache_init(&crom_cache, 8*16, crom_max);
 }
 
+/* One bit per fix tile: set when all its pixels are 0 (transparent). Games
+ * fill unused fix cells with such a tile (rarely tile 0), so most of the 1120
+ * cells would otherwise cost a cache lookup and an RSP command per frame. */
+static uint8_t *srom_blank;
+
+static void srom_scan_blank(void) {
+	free(srom_blank);
+	srom_blank = calloc((srom_num_tiles + 7) / 8, 1);
+	if (!srom_blank) return;
+	static uint8_t buf[4096] __attribute__((aligned(16)));
+	int done = 0;
+	while (done < srom_num_tiles) {
+		int n = srom_num_tiles - done; if (n > (int)sizeof(buf) / 32) n = sizeof(buf) / 32;
+		#ifdef N64
+		dfs_seek(srom_file, done * 32, SEEK_SET);
+		if (dfs_read(buf, 1, n * 32, srom_file) != n * 32) break;
+		#else
+		fseek(srom_file, done * 32, SEEK_SET);
+		if (fread(buf, 1, n * 32, srom_file) != (size_t)(n * 32)) break;
+		#endif
+		for (int t = 0; t < n; t++) {
+			const uint32_t *w = (const uint32_t *)(buf + t * 32);
+			if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]))
+				srom_blank[(done + t) >> 3] |= 1 << ((done + t) & 7);
+		}
+		done += n;
+	}
+}
+
+bool srom_tile_blank(int spritenum) {
+	if (spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
+	return srom_blank && (srom_blank[spritenum >> 3] >> (spritenum & 7)) & 1;
+}
+
 uint8_t* srom_get_sprite(int spritenum) {
 	if (spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
 	uint8_t *pix = sprite_cache_lookup(&srom_cache, spritenum);
@@ -142,6 +176,7 @@ void srom_set_bank(int bank) {
 
 		sprite_cache_reset(&srom_cache);
 		srom_num_tiles = len / (4*8);
+		srom_scan_blank();
 	}
 }
 
