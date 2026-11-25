@@ -488,7 +488,9 @@ int main(int argc, char *argv[]) {
 		}
 		uint32_t curtime = TICKS_READ();
 		if (TICKS_DISTANCE(fps_time, curtime) > TICKS_FROM_MS(1000)) {
-			static uint32_t fps_drawn;
+			static uint32_t fps_drawn, lost_seen;
+			extern volatile uint32_t rsp_lost_wakeups;
+			if (rsp_lost_wakeups != lost_seen) { lost_seen = rsp_lost_wakeups; debugf("[RSP] lost wake-ups recovered: %lu\n", (unsigned long)lost_seen); }
 			debugf("FPS: %.1f drawn %.1f\n", (g_frame - fps_frame) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime),
 				(g_drawn - fps_drawn) * (float)TICKS_PER_SECOND / TICKS_DISTANCE(fps_time, curtime));
 			fps_drawn = g_drawn;

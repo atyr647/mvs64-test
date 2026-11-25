@@ -1,4 +1,5 @@
 #include "platform.h"
+#include <rspq_constants.h>   /* SP_STATUS_SIG_MORE, SP_WSTATUS_SET_SIG_MORE */
 #include <memory.h>
 
 volatile int N64_FRAME = 0;
@@ -10,8 +11,24 @@ uint8_t keystate[256];
 
 extern char end __attribute__((section (".data")));
 
+/* Lost RSP wake-ups (seen as "RSP CRASH | display_get ... wait loop timed
+ * out", PC:018 STATUS [halt broke sig5 sig6 sig7]): rspq wakes the RSP by
+ * setting SIG_MORE and clearing HALT, and if that lands between the ucode's
+ * SIG_MORE check and its `break` (RSPQCmd_WaitNewInput) the RSP sleeps with
+ * work queued; libdragon's wait loops then only spin. Halted with SIG_MORE
+ * set happens in no other case (the ucode clears SIG_MORE when it wakes), so
+ * the VBlank interrupt re-issues the wake: a lost wake-up now costs at most a
+ * frame instead of a hang. Same diagnosis as gpsp64's
+ * tools/libdragon-patches/rspq-lost-wakeup.patch, without patching the SDK. */
+volatile uint32_t rsp_lost_wakeups;
+
 static void vblank_handler(void) {
     N64_FRAME++;
+    uint32_t st = *SP_STATUS;
+    if ((st & (SP_STATUS_HALTED | SP_STATUS_SIG_MORE)) == (SP_STATUS_HALTED | SP_STATUS_SIG_MORE)) {
+        rsp_lost_wakeups++;
+        *SP_STATUS = SP_WSTATUS_SET_SIG_MORE | SP_WSTATUS_CLEAR_HALT | SP_WSTATUS_CLEAR_BROKE;
+    }
 }
 
 void plat_init(int audiofreq, int fps) {
