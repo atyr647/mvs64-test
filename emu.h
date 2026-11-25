@@ -5,7 +5,9 @@
 //   0 - never frameskip, game might slowdown
 //   1 - fixed skip (draw 1 every 3)
 //   2 - auto mode. Renders when ahead of real time, skips when behind
+#ifndef CONFIG_FRAMESKIP_MODE
 #define CONFIG_FRAMESKIP_MODE            2
+#endif
 
 #include <stdint.h>
 #include <stdbool.h>
