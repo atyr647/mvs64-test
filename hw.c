@@ -240,12 +240,26 @@ void m68k_write_memory_8_slow(unsigned int address, unsigned int value) {
 }
 
 void m68k_write_memory_16_slow(unsigned int address, unsigned int value) {
+	/* The video chip's VRAM ports, straight to the handlers that write_hwio
+	 * would reach: the game streams sprite data through $3C0002, and the
+	 * generic path (bank callback, size and region checks) cost several
+	 * times the write itself. */
+	switch (address) {
+	case 0x3C0000: lspc_vram_addr_w(value); return;
+	case 0x3C0002: lspc_vram_data_w(value); return;
+	case 0x3C0004: lspc_vram_modulo_w(value); return;
+	}
 	Bank *b = &banks[(address>>20)&0xF];
 	if (b->w) { b->w(address, value, 2); return; }
 	if (b->mem) { *(u_uint16_t*)(b->mem + (address & b->mask)) = BE16(value); return; }
 }
 
 void m68k_write_memory_32_slow(unsigned int address, unsigned int value) {
+	if (address == 0x3C0000) {            /* VRAM address, then data (see above) */
+		lspc_vram_addr_w(value >> 16);
+		lspc_vram_data_w(value & 0xFFFF);
+		return;
+	}
 	Bank *b = &banks[(address>>20)&0xF];
 	if (b->w) { b->w(address, value, 4); return; }
 	if (b->mem) { *(u_uint32_t*)(b->mem + (address & b->mask)) = BE32(value); return; }
