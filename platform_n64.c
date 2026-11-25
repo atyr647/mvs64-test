@@ -132,7 +132,9 @@ void plat_endframe(void) {
  * PC, between two frame numbers; the histogram is dumped to the debug log and
  * symbolized off-target with tools/prof/symbolize.py. */
 extern char __text_start[], __text_end[];
-#define PROF_SHIFT 7
+#ifndef PROF_SHIFT
+#define PROF_SHIFT 7   /* bucket = 128 bytes; -DPROF_SHIFT=5 for one I-cache line (cold fillers sit next to hot code in a coloured layout) */
+#endif
 #define PROF_BUCKETS (0x180000 >> PROF_SHIFT)
 static uint16_t prof_hist[PROF_BUCKETS];
 static uint32_t prof_other, prof_total;
